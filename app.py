@@ -469,7 +469,10 @@ def inspect_cognee_dialog():
             {
                 "Time": [local_time(t) for t in recalled_df["ts"]],
                 "Part": [part_label(p) for p in recalled_df["part_id"]],
-                "Recalled memory": recalled_df["message"],
+                "Recalled memory": [
+                    cognee_mem._extract_text(m, multiline=False, for_part=p) or str(m or "")
+                    for p, m in zip(recalled_df["part_id"], recalled_df["message"])
+                ],
             }
         )
         st.dataframe(show_df, hide_index=True, width="stretch")
@@ -1296,7 +1299,14 @@ with tab_audit:
                         icon="🔎",
                     )
                 for _, mem_row in recalled_rows.iterrows():
-                    st.info(f"**Recalled from Cognee memory:** {mem_row['message']}", icon="🧠")
+                    mem_txt = plain_english(mem_row["message"])
+                    try:
+                        import memory as _cmem
+
+                        mem_txt = _cmem._extract_text(mem_row["message"], multiline=False, for_part=pid) or mem_txt
+                    except Exception:
+                        pass
+                    st.info(f"**Recalled from Cognee memory:** {mem_txt}", icon="🧠")
                 show_details = st.toggle("Show raw data", key=f"details_{pid}")
                 for _, row in steps.iterrows():
                     label = STEP_LABELS.get(row["step"], str(row["step"]).replace("_", " ").capitalize())

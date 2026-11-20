@@ -12,8 +12,10 @@ Design rules:
 
 from __future__ import annotations
 
+import csv
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -27,8 +29,36 @@ load_dotenv(ROOT / ".env", override=False)
 log = logging.getLogger("parts_buyer.memory")
 
 POLICY_PATH = ROOT / "docs" / "policy.md"
+PARTS_CSV_PATH = ROOT / "data" / "parts.csv"
 DEFAULT_DATASET = "parts_buyer_memory"
 DEFAULT_SESSION_ID = "parts_buyer"
+
+
+def _load_part_names() -> dict[str, str]:
+    names = {
+        "P01": "Battery pack 14.4V",
+        "P02": "Handpiece motor seal kit",
+        "P03": "Drill chuck assembly",
+        "P04": "Foot switch cable",
+        "P05": "Camera head cable",
+        "P06": "Light source lamp module",
+        "P07": "Shaver blade hub",
+        "P08": "Sterilization case latch",
+    }
+    if PARTS_CSV_PATH.exists():
+        try:
+            with PARTS_CSV_PATH.open(encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    pid = (row.get("part_id") or "").strip()
+                    pname = (row.get("name") or "").strip()
+                    if pid and pname:
+                        names[pid] = pname
+        except Exception:
+            pass
+    return names
+
+
+PART_NAMES = _load_part_names()
 
 _lock = threading.Lock()
 _policy_synced = False
@@ -84,6 +114,7 @@ def check_connection(timeout: float = 3.5) -> tuple[bool, str]:
             f"{base_url}/api/v1/datasets",
             headers=_headers(api_key, tenant_id),
             timeout=timeout,
+            follow_redirects=True,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -121,6 +152,7 @@ def seed_policy(*, force: bool = False, background: bool = True, timeout: float 
             },
             files=[("data", ("policy.md", policy_bytes, "text/markdown"))],
             timeout=timeout,
+            follow_redirects=True,
         )
         if resp.status_code in (200, 201, 202):
             with _lock:
@@ -133,32 +165,147 @@ def seed_policy(*, force: bool = False, background: bool = True, timeout: float 
         return {"ok": False, "reason": str(exc)}
 
 
-def _extract_text(payload: Any) -> str:
-    """Normalize Cognee /recall or /search responses into concise readable text."""
-    if payload is None:
+def _ensure_period(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
         return ""
+    return s if s[-1] in ".!?" else f"{s}."
+
+
+def _humanize_item(raw_item: str, *, for_part: str | None = None) -> str:
+    """Turn raw Cognee QA / audit snippets into clean, natural-English lines."""
+    s = (raw_item or "").strip()
+    if not s:
+        return ""
+
+    # Strip rule codes like "(R4)" or "R6: " and add commas to 4+ digit dollar figures
+    s = re.sub(r"\s*\(R\d+\)", "", s)
+    s = re.sub(r"\bR\d+\s*:\s*", "", s)
+    s = re.sub(
+        r"\$(\d{4,})(\.\d+)?",
+        lambda m: "$" + f"{int(m.group(1)):,}" + (m.group(2) or ""),
+        s,
+    )
+
+    # Fix missing period when two audit messages were joined with a space
+    # e.g. "...needs it by Nov 22 Rechecked OEM Direct:" -> "...needs it by Nov 22. Rechecked OEM Direct:"
+    s = re.sub(
+        r"([A-Za-z0-9\)])\s+(Rechecked\s+|Placed\s+PO-|Held\s+PO-|Asked\s+owner|No\s+offer\s+meets|(?:Broker\s+[A-Z]|OEM\s+Direct)\s+(?:would\b|is\s+not\b))",
+        r"\1. \2",
+        s,
+    )
+
+    # Simplify repetitive live-recheck wording:
+    # "Rechecked Broker A: catalog said 50 in stock at $28, live says 50 at $28."
+    def _simplify_recheck(m: re.Match) -> str:
+        sup, cat_qty, cat_p, live_qty, live_p = (
+            m.group(1).strip(),
+            m.group(2),
+            m.group(3),
+            m.group(4),
+            m.group(5),
+        )
+        if cat_qty == live_qty and cat_p == live_p:
+            return f"Live check confirmed {sup} ({live_qty} in stock at ${live_p})."
+        return f"Live check on {sup}: catalog listed {cat_qty} at ${cat_p}, live showed {live_qty} at ${live_p}."
+
+    s = re.sub(
+        r"Rechecked\s+([^:]+):\s*catalog said\s+(\d+)\s+in stock at\s+\$([0-9,]+(?:\.[0-9]+)?),\s*live says\s+(\d+)\s+at\s+\$([0-9,]+(?:\.[0-9]+)?)\.?",
+        _simplify_recheck,
+        s,
+    )
+
+    # Smooth out "Total $295 (no spending cap on this part). 10 added to on order."
+    s = re.sub(
+        r"Total\s+(\$[0-9,]+(?:\.[0-9]+)?)\s*\(([^)]+)\)\.\s*(\d+)\s+added to on order\.?",
+        r"\3 units, \1 total (\2).",
+        s,
+    )
+    s = re.sub(r"(\d+)\s+added to on order\.?", r"(\1 units ordered).", s)
+    s = s.replace("no spending cap on this part", "no spending cap")
+
+    # Replace machine prefix: "Run run-20261120T233700-c19c54 lesson for P02: ..."
+    m_prefix = re.match(
+        r"^(?:Run\s+\S+\s+lesson\s+for\s+|Lesson\s+for\s+)(P\d{2})(?:\s*\([^)]*\))?\s*:\s*(.+)$",
+        s,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m_prefix:
+        pid = m_prefix.group(1).upper()
+        body = _ensure_period(m_prefix.group(2))
+        if for_part and for_part.upper() == pid:
+            return body
+        pname = PART_NAMES.get(pid)
+        label = f"**{pid} · {pname}**" if pname else f"**{pid}**"
+        return f"{label} — {body}"
+
+    # Also handle "**P02** (Name): ..." or "P02 (Name): ..." when recalling for a specific part
+    m_part = re.match(
+        r"^\*{0,2}(P\d{2})\*{0,2}(?:\s*[·\-]\s*[^:—]+|\s*\([^)]*\))?\s*[:—-]\s*(.+)$",
+        s,
+        flags=re.DOTALL,
+    )
+    if m_part:
+        pid = m_part.group(1).upper()
+        body = _ensure_period(m_part.group(2))
+        if for_part and for_part.upper() == pid:
+            return body
+        pname = PART_NAMES.get(pid)
+        label = f"**{pid} · {pname}**" if pname else f"**{pid}**"
+        return f"{label} — {body}"
+
+    return _ensure_period(s)
+
+
+def _extract_items(payload: Any) -> list[str]:
+    """Extract raw memory strings from Cognee /recall or /search responses."""
+    if payload is None:
+        return []
     if isinstance(payload, str):
-        return payload.strip()
+        text = payload.strip()
+        if not text:
+            return []
+        # Split legacy pipe-joined strings if present
+        return [chunk.strip() for chunk in text.split(" | ") if chunk.strip()]
     if isinstance(payload, list):
-        parts: list[str] = []
-        for item in payload[:3]:
-            t = _extract_text(item)
-            if t:
-                parts.append(t)
-        return " | ".join(parts)
+        items: list[str] = []
+        for entry in payload[:5]:
+            for sub in _extract_items(entry):
+                if sub not in items:
+                    items.append(sub)
+        return items
     if isinstance(payload, dict):
         for key in ("results", "data", "items"):
             if key in payload and isinstance(payload[key], list):
-                return _extract_text(payload[key])
+                return _extract_items(payload[key])
         for key in ("text", "answer", "content", "summary", "search_result"):
             val = payload.get(key)
             if isinstance(val, str) and val.strip():
-                return val.strip()
+                return _extract_items(val)
             if isinstance(val, list) and val:
-                joined = _extract_text(val)
-                if joined:
-                    return joined
-    return ""
+                found = _extract_items(val)
+                if found:
+                    return found
+    return []
+
+
+def _extract_text(payload: Any, *, multiline: bool = False, for_part: str | None = None) -> str:
+    """Normalize Cognee /recall or /search responses into clean, human-readable text."""
+    raw_items = _extract_items(payload)
+    if not raw_items:
+        return ""
+    cleaned: list[str] = []
+    for item in raw_items[:4]:
+        h = _humanize_item(item, for_part=for_part)
+        if h and h not in cleaned:
+            cleaned.append(h)
+    if not cleaned:
+        return ""
+    if multiline:
+        if len(cleaned) == 1:
+            return cleaned[0]
+        return "\n".join(f"- {line}" for line in cleaned)
+    return " · ".join(cleaned)
 
 
 def recall_for_part(
@@ -190,6 +337,7 @@ def recall_for_part(
                 "top_k": 3,
             },
             timeout=timeout,
+            follow_redirects=True,
         )
         # 2. If dataset doesn't exist yet (404) or session-only recall is needed, retry session-scoped recall
         if resp.status_code == 404:
@@ -202,6 +350,7 @@ def recall_for_part(
                     "top_k": 3,
                 },
                 timeout=timeout,
+                follow_redirects=True,
             )
         # 3. Fallback to /api/v1/search if /recall returned non-200
         if resp.status_code != 200:
@@ -215,13 +364,14 @@ def recall_for_part(
                     "top_k": 3,
                 },
                 timeout=timeout,
+                follow_redirects=True,
             )
 
         if resp.status_code != 200:
             _sponsor_error(f"recall HTTP {resp.status_code}: {resp.text[:140]}")
             return None
 
-        text = _extract_text(resp.json())
+        text = _extract_text(resp.json(), multiline=False, for_part=part_id)
         if not text:
             return None
         snippet = text[:420].rstrip() + ("…" if len(text) > 420 else "")
@@ -253,15 +403,18 @@ def remember_run_lessons(run_id: str, entries: list[dict[str, Any]], timeout: fl
         return {"ok": True, "stored": 0}
 
     stored = 0
-    summary_lines = [f"# Run lessons ({run_id})"]
+    summary_lines = [f"# Purchasing Lessons ({run_id})"]
     try:
         httpx = _http_client()
         for pid, rows in sorted(by_part.items()):
-            lesson_bits = [r["message"] for r in rows[:4] if r.get("message")]
+            lesson_bits = [_ensure_period(r["message"]) for r in rows[:4] if r.get("message")]
             if not lesson_bits:
                 continue
-            lesson_text = " ".join(lesson_bits)
-            summary_lines.append(f"- **{pid}**: {lesson_text}")
+            pname = PART_NAMES.get(pid, "")
+            part_header = f"{pid} ({pname})" if pname else pid
+            raw_joined = " ".join(lesson_bits)
+            clean_body = _humanize_item(raw_joined, for_part=pid)
+            summary_lines.append(f"- **{part_header}**: {clean_body}")
             # Fast session entry so the next run immediately recalls this lesson
             r = httpx.post(
                 f"{base_url}/api/v1/remember/entry",
@@ -269,13 +422,14 @@ def remember_run_lessons(run_id: str, entries: list[dict[str, Any]], timeout: fl
                 json={
                     "entry": {
                         "type": "qa",
-                        "question": f"What happened on past runs for {pid}?",
-                        "answer": f"Run {run_id} lesson for {pid}: {lesson_text}",
+                        "question": f"What happened on past runs for {part_header}?",
+                        "answer": f"{part_header}: {clean_body}",
                     },
                     "dataset_name": dataset,
                     "session_id": DEFAULT_SESSION_ID,
                 },
                 timeout=timeout,
+                follow_redirects=True,
             )
             if r.status_code in (200, 201, 202):
                 stored += 1
@@ -288,6 +442,7 @@ def remember_run_lessons(run_id: str, entries: list[dict[str, Any]], timeout: fl
             data={"datasetName": dataset, "run_in_background": "true"},
             files=[("data", (f"lessons_{run_id}.md", doc_bytes, "text/markdown"))],
             timeout=timeout,
+            follow_redirects=True,
         )
         return {"ok": True, "stored": stored, "dataset": dataset}
     except Exception as exc:
@@ -324,6 +479,7 @@ def inspect_memory(timeout: float = 5.0) -> dict[str, Any]:
             f"{base_url}/api/v1/datasets",
             headers=_headers(api_key, tenant_id),
             timeout=timeout,
+            follow_redirects=True,
         )
         if resp.status_code != 200:
             info["status"] = f"HTTP {resp.status_code}: {resp.text[:120]}"
@@ -360,6 +516,7 @@ def inspect_memory(timeout: float = 5.0) -> dict[str, Any]:
                     f"{base_url}/api/v1/datasets/{target_dataset_id}/data",
                     headers=_headers(api_key, tenant_id),
                     timeout=timeout,
+                    follow_redirects=True,
                 )
                 if doc_resp.status_code == 200:
                     doc_raw = doc_resp.json()
@@ -408,6 +565,7 @@ def query_memory(query: str, *, timeout: float = 8.0) -> dict[str, Any]:
                 "top_k": 3,
             },
             timeout=timeout,
+            follow_redirects=True,
         )
         if resp.status_code == 404:
             endpoint = "/api/v1/recall (session)"
@@ -420,6 +578,7 @@ def query_memory(query: str, *, timeout: float = 8.0) -> dict[str, Any]:
                     "top_k": 3,
                 },
                 timeout=timeout,
+                follow_redirects=True,
             )
         if resp.status_code != 200:
             endpoint = "/api/v1/search"
@@ -433,6 +592,7 @@ def query_memory(query: str, *, timeout: float = 8.0) -> dict[str, Any]:
                     "top_k": 3,
                 },
                 timeout=timeout,
+                follow_redirects=True,
             )
 
         elapsed_s = round(time.perf_counter() - t0, 2)
@@ -449,7 +609,7 @@ def query_memory(query: str, *, timeout: float = 8.0) -> dict[str, Any]:
             }
 
         payload = resp.json()
-        text = _extract_text(payload)
+        text = _extract_text(payload, multiline=True)
         if len(text) > 1500:
             text = text[:1500].rstrip() + "…"
         return {
