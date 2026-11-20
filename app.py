@@ -269,6 +269,11 @@ with st.sidebar:
     crash_test = st.toggle("Crash test", help="Stops the run on purpose after 2 orders, to show a restart never orders twice.")
     run_clicked = st.button("Run agent", type="primary", width="stretch")
     reset_clicked = st.button("Reset demo", width="stretch")
+    inspect_memory_clicked = st.button(
+        "🧠 Inspect Cognee",
+        width="stretch",
+        help="Check Cognee Cloud status, stored datasets, sync policy.md, and test live memory recall.",
+    )
 
     for _name, _exc in missing:
         st.warning(f"backend not ready: {_name}")
@@ -312,6 +317,172 @@ def row_data(row):
         return json.loads(row["data_json"] or "{}")
     except (TypeError, ValueError):
         return {}
+
+
+@st.dialog("Cognee Cloud Memory", width="large")
+def inspect_cognee_dialog():
+    try:
+        import memory as cognee_mem
+    except Exception as exc:
+        st.error(f"Could not load memory module: {exc}")
+        return
+
+    if "cognee_inspect" not in st.session_state:
+        with st.spinner("Checking Cognee Cloud…"):
+            st.session_state["cognee_inspect"] = cognee_mem.inspect_memory()
+
+    info = st.session_state["cognee_inspect"]
+
+    # Connection status banner
+    if info.get("connected"):
+        st.success(f"**{info['status']}**", icon="🧠")
+    elif info.get("enabled"):
+        st.warning(f"Cognee Cloud unreachable: **{info.get('status')}**", icon="⚠️")
+    else:
+        st.info(
+            f"**{info.get('status')}** — set `USE_COGNEE=1`, `COGNEE_API_URL`, and `COGNEE_API_KEY` in `.env` (or Railway Variables).",
+            icon="ℹ️",
+        )
+
+    # Config overview + action buttons
+    m1, m2, m3 = st.columns(3)
+    m1.caption(f"**Dataset**\n\n`{info.get('dataset', 'parts_buyer_memory')}`")
+    m2.caption(f"**Session**\n\n`{info.get('session_id', 'parts_buyer')}`")
+    m3.caption(f"**Policy synced (this process)**\n\n{'Yes' if info.get('policy_synced') else 'Not yet'}")
+    if info.get("api_url"):
+        st.caption(f"Endpoint: `{info['api_url']}`")
+    if info.get("last_error"):
+        st.caption(f":orange[Last error: {info['last_error']}]")
+
+    b1, b2, _ = st.columns([1.1, 1.3, 2.2])
+    if b1.button("Refresh status", key="cognee_refresh_btn", width="stretch"):
+        with st.spinner("Checking Cognee Cloud…"):
+            st.session_state["cognee_inspect"] = cognee_mem.inspect_memory()
+        info = st.session_state["cognee_inspect"]
+    if b2.button(
+        "Sync policy.md now",
+        key="cognee_seed_btn",
+        width="stretch",
+        disabled=not info.get("enabled"),
+    ):
+        with st.spinner("Uploading docs/policy.md to Cognee Cloud…"):
+            st.session_state["cognee_seed_result"] = cognee_mem.seed_policy(force=True, background=True)
+            st.session_state["cognee_inspect"] = cognee_mem.inspect_memory()
+        info = st.session_state["cognee_inspect"]
+
+    seed_res = st.session_state.get("cognee_seed_result")
+    if seed_res is not None:
+        if seed_res.get("ok"):
+            st.success(
+                f"Uploaded `docs/policy.md` to dataset `{seed_res.get('dataset')}` (HTTP {seed_res.get('status', 200)})."
+            )
+        else:
+            st.error(f"Policy sync failed: {seed_res.get('reason', 'unknown error')}")
+
+    # Stored datasets & documents
+    datasets = info.get("datasets") or []
+    documents = info.get("documents") or []
+    if datasets or documents:
+        st.divider()
+        if datasets:
+            st.markdown("**Datasets in Cognee Cloud**")
+            ds_df = pd.DataFrame(
+                [
+                    {
+                        "Dataset": d.get("name") or "(unnamed)",
+                        "Active": "✓" if d.get("name") == info.get("dataset") else "",
+                        "Created": local_time(d["created_at"], "%b %-d, %-I:%M %p") if d.get("created_at") else "",
+                    }
+                    for d in datasets
+                ]
+            )
+            st.dataframe(ds_df, hide_index=True, width="stretch")
+        if documents:
+            st.markdown(f"**Documents in `{info.get('dataset')}`**")
+            doc_df = pd.DataFrame(
+                [
+                    {
+                        "Document": d.get("name") or "(unnamed)",
+                        "Type": d.get("type") or "",
+                        "Added": local_time(d["created_at"], "%b %-d, %-I:%M %p") if d.get("created_at") else "",
+                    }
+                    for d in documents
+                ]
+            )
+            st.dataframe(doc_df, hide_index=True, width="stretch")
+
+    # Live recall tester
+    st.divider()
+    st.markdown("**Test live memory recall**")
+    known_parts = part_names or _sidebar_part_names
+    part_choices = [f"{pid} · {known_parts[pid]}" for pid in sorted(known_parts)] + ["Custom query"]
+    picked = st.selectbox("Quick target", part_choices, index=0, key="cognee_query_target")
+    if picked == "Custom query":
+        default_q = "What is our spending limit and supplier approval policy?"
+    else:
+        picked_pid = picked.split(" · ", 1)[0]
+        picked_name = known_parts.get(picked_pid, "")
+        default_q = f"Purchasing policy rules and past supplier lessons for {picked_pid} ({picked_name})"
+
+    if st.session_state.get("cognee_last_target") != picked:
+        st.session_state["cognee_last_target"] = picked
+        st.session_state["cognee_query_text"] = default_q
+
+    query_text = st.text_input("Query", key="cognee_query_text")
+    if st.button(
+        "Query Cognee",
+        type="primary",
+        key="cognee_query_btn",
+        disabled=not info.get("enabled"),
+    ):
+        with st.spinner("Querying Cognee Cloud…"):
+            st.session_state["cognee_query_result"] = cognee_mem.query_memory(query_text)
+
+    qres = st.session_state.get("cognee_query_result")
+    if qres is not None:
+        if qres.get("ok"):
+            if qres.get("text"):
+                st.info(qres["text"], icon="🧠")
+            else:
+                st.caption("Connected, but no matching memories were returned yet. Sync policy.md or run the agent first.")
+            st.caption(
+                f"Answered in {qres.get('elapsed_s', 0):.2f}s via `{qres.get('endpoint')}` "
+                f"(dataset: `{qres.get('dataset')}`)"
+            )
+        else:
+            st.error(qres.get("error") or "Cognee query failed.")
+        if qres.get("raw") is not None:
+            with st.expander("Raw API response"):
+                if isinstance(qres["raw"], (dict, list)):
+                    st.json(qres["raw"])
+                else:
+                    st.code(str(qres["raw"]))
+
+    # Recent recalls logged locally in SQLite audit trail
+    st.divider()
+    st.markdown("**Recent recalls in Audit Trail**")
+    recalled_df = read_table(
+        "SELECT ts, part_id, message FROM audit_log WHERE step = 'recalled' ORDER BY ts DESC, id DESC LIMIT 10"
+    )
+    if recalled_df is not None and not recalled_df.empty:
+        show_df = pd.DataFrame(
+            {
+                "Time": [local_time(t) for t in recalled_df["ts"]],
+                "Part": [part_label(p) for p in recalled_df["part_id"]],
+                "Recalled memory": recalled_df["message"],
+            }
+        )
+        st.dataframe(show_df, hide_index=True, width="stretch")
+    else:
+        st.caption("No Cognee recalls logged in the local audit trail yet. Run the agent with USE_COGNEE=1 to populate.")
+
+
+if inspect_memory_clicked:
+    st.session_state.pop("cognee_inspect", None)
+    st.session_state.pop("cognee_seed_result", None)
+    st.session_state.pop("cognee_query_result", None)
+    inspect_cognee_dialog()
+
 
 
 def compute_kpis(orders_df, audit_df, active_run_id=None):

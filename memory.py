@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -292,3 +293,186 @@ def remember_run_lessons(run_id: str, entries: list[dict[str, Any]], timeout: fl
     except Exception as exc:
         _sponsor_error(f"remember_run_lessons failed ({type(exc).__name__}: {exc})")
         return {"ok": False, "stored": stored, "reason": str(exc)}
+
+
+def inspect_memory(timeout: float = 5.0) -> dict[str, Any]:
+    """Return Cognee Cloud connection state, datasets, and documents (no secrets). Never raises."""
+    enabled, base_url, api_key, tenant_id, dataset = _config()
+    info: dict[str, Any] = {
+        "enabled": bool(enabled and base_url and api_key),
+        "flag_on": enabled,
+        "connected": False,
+        "status": "",
+        "dataset": dataset,
+        "session_id": DEFAULT_SESSION_ID,
+        "api_url": base_url,
+        "policy_synced": _policy_synced,
+        "last_error": _last_error,
+        "datasets": [],
+        "documents": [],
+    }
+    if not enabled:
+        info["status"] = "Disabled (set USE_COGNEE=1)"
+        return info
+    if not base_url or not api_key:
+        info["status"] = "Missing COGNEE_API_URL or COGNEE_API_KEY"
+        return info
+
+    try:
+        httpx = _http_client()
+        resp = httpx.get(
+            f"{base_url}/api/v1/datasets",
+            headers=_headers(api_key, tenant_id),
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            info["status"] = f"HTTP {resp.status_code}: {resp.text[:120]}"
+            return info
+
+        raw = resp.json()
+        raw_list = raw if isinstance(raw, list) else (raw.get("datasets") or raw.get("data") or [])
+        datasets: list[dict[str, Any]] = []
+        target_dataset_id: str | None = None
+        for item in raw_list:
+            if not isinstance(item, dict):
+                continue
+            ds_name = str(item.get("name") or item.get("datasetName") or "")
+            ds_id = str(item.get("id") or item.get("dataset_id") or "")
+            datasets.append(
+                {
+                    "name": ds_name,
+                    "id": ds_id,
+                    "created_at": str(item.get("created_at") or item.get("createdAt") or ""),
+                }
+            )
+            if ds_name == dataset and ds_id:
+                target_dataset_id = ds_id
+
+        info["connected"] = True
+        info["datasets"] = datasets
+        count = len(datasets)
+        info["status"] = f"Connected ({count} dataset{'s' if count != 1 else ''})"
+
+        # Best-effort fetch of documents inside the configured dataset
+        if target_dataset_id:
+            try:
+                doc_resp = httpx.get(
+                    f"{base_url}/api/v1/datasets/{target_dataset_id}/data",
+                    headers=_headers(api_key, tenant_id),
+                    timeout=timeout,
+                )
+                if doc_resp.status_code == 200:
+                    doc_raw = doc_resp.json()
+                    doc_list = doc_raw if isinstance(doc_raw, list) else (doc_raw.get("data") or [])
+                    docs: list[dict[str, Any]] = []
+                    for d in doc_list:
+                        if not isinstance(d, dict):
+                            continue
+                        docs.append(
+                            {
+                                "name": str(d.get("name") or d.get("raw_data_location") or d.get("id") or ""),
+                                "type": str(d.get("mime_type") or d.get("extension") or ""),
+                                "created_at": str(d.get("created_at") or d.get("createdAt") or ""),
+                            }
+                        )
+                    info["documents"] = docs
+            except Exception:
+                pass
+        return info
+    except Exception as exc:
+        _sponsor_error(f"inspect failed ({type(exc).__name__})")
+        info["status"] = f"Unreachable ({type(exc).__name__}: {exc})"
+        return info
+
+
+def query_memory(query: str, *, timeout: float = 8.0) -> dict[str, Any]:
+    """Run an ad-hoc memory recall/search query against Cognee Cloud for inspection. Never raises."""
+    cleaned = (query or "").strip()
+    if not cleaned:
+        return {"ok": False, "text": "", "error": "Enter a question to query Cognee."}
+    if not is_enabled():
+        return {"ok": False, "text": "", "error": "Cognee Cloud is disabled (set USE_COGNEE=1, COGNEE_API_URL, COGNEE_API_KEY)."}
+
+    _, base_url, api_key, tenant_id, dataset = _config()
+    t0 = time.perf_counter()
+    endpoint = "/api/v1/recall"
+    try:
+        httpx = _http_client()
+        resp = httpx.post(
+            f"{base_url}/api/v1/recall",
+            headers=_headers(api_key, tenant_id, json_body=True),
+            json={
+                "query": cleaned,
+                "datasets": [dataset],
+                "session_id": DEFAULT_SESSION_ID,
+                "top_k": 3,
+            },
+            timeout=timeout,
+        )
+        if resp.status_code == 404:
+            endpoint = "/api/v1/recall (session)"
+            resp = httpx.post(
+                f"{base_url}/api/v1/recall",
+                headers=_headers(api_key, tenant_id, json_body=True),
+                json={
+                    "query": cleaned,
+                    "session_id": DEFAULT_SESSION_ID,
+                    "top_k": 3,
+                },
+                timeout=timeout,
+            )
+        if resp.status_code != 200:
+            endpoint = "/api/v1/search"
+            resp = httpx.post(
+                f"{base_url}/api/v1/search",
+                headers=_headers(api_key, tenant_id, json_body=True),
+                json={
+                    "query": cleaned,
+                    "datasets": [dataset],
+                    "search_type": "GRAPH_COMPLETION",
+                    "top_k": 3,
+                },
+                timeout=timeout,
+            )
+
+        elapsed_s = round(time.perf_counter() - t0, 2)
+        if resp.status_code != 200:
+            return {
+                "ok": False,
+                "text": "",
+                "endpoint": endpoint,
+                "status_code": resp.status_code,
+                "elapsed_s": elapsed_s,
+                "dataset": dataset,
+                "raw": resp.text[:400],
+                "error": f"HTTP {resp.status_code}: {resp.text[:180]}",
+            }
+
+        payload = resp.json()
+        text = _extract_text(payload)
+        if len(text) > 1500:
+            text = text[:1500].rstrip() + "…"
+        return {
+            "ok": True,
+            "text": text,
+            "endpoint": endpoint,
+            "status_code": resp.status_code,
+            "elapsed_s": elapsed_s,
+            "dataset": dataset,
+            "raw": payload,
+            "error": None,
+        }
+    except Exception as exc:
+        elapsed_s = round(time.perf_counter() - t0, 2)
+        _sponsor_error(f"query_memory failed ({type(exc).__name__}: {exc})")
+        return {
+            "ok": False,
+            "text": "",
+            "endpoint": endpoint,
+            "status_code": None,
+            "elapsed_s": elapsed_s,
+            "dataset": dataset,
+            "raw": None,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
