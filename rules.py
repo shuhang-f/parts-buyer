@@ -333,25 +333,41 @@ def recheck_offer(offer_id, qty, run_id):
                 "passed": False, "reason": f"offer {offer_id} not found"}
     live = suppliers.recheck_offer(offer_id)
     name = _supplier_name(row["name"])
+    allow_live_update = os.getenv("SIMULATE_PRICE_CHANGE", "0").strip() == "1"
+    price_changed = float(live["unit_price"]) != float(row["unit_price"])
     reasons = []
     if live["live_stock"] < qty:
         reasons.append(f"live stock {live['live_stock']}, need {qty}")
-    if float(live["unit_price"]) != float(row["unit_price"]):
+    if price_changed and not allow_live_update:
         reasons.append(f"price changed from {_money(row['unit_price'])} to {_money(live['unit_price'])}")
+    passed = not reasons
+    if passed:
+        db.update_part_buy_price(row["part_id"], live["unit_price"])
+    note_reason = (
+        "; ".join(reasons)
+        if reasons
+        else (
+            f"stock confirmed; live buy price updated from {_money(row['unit_price'])} to {_money(live['unit_price'])}"
+            if price_changed
+            else "stock and price confirmed"
+        )
+    )
     result = {
         "offer_id": offer_id,
         "supplier_id": row["supplier_id"],
         "live_stock": live["live_stock"],
         "live_price": live["unit_price"],
-        "passed": not reasons,
+        "listed_price": row["unit_price"],
+        "price_changed": price_changed,
+        "passed": passed,
         "qty": qty,
-        "reason": "; ".join(reasons) or "stock and price confirmed",
+        "reason": note_reason,
     }
     audit.log(
         run_id, row["part_id"], "recheck",
         f"Rechecked {name}: catalog said {row['listed_stock']} in stock at {_money(row['unit_price'])}, "
         f"live says {live['live_stock']} at {_money(live['unit_price'])}.",
-        {**result, "listed_stock": row["listed_stock"], "listed_price": row["unit_price"], "rule": "R5"},
+        {**result, "listed_stock": row["listed_stock"], "rule": "R5"},
     )
     if reasons:
         audit.log(run_id, row["part_id"], "rejected_option",
@@ -475,6 +491,7 @@ def place_order(part_id, offer_id, qty, run_id, spend_limit=None, part_limits=No
             return {"status": "exists", "po_id": o["po_id"],
                     "reason": SKIP_MESSAGES[o["status"]].format(po_id=o["po_id"])}
 
+        db.update_part_buy_price(part_id, unit_price, conn=conn)
         audit.log(run_id, part_id, "chosen",
                   f"Chose {offer['supplier_name']}{bulk_note}: {qty} x {_money(unit_price)} + "
                   f"{_money(shipping)} shipping = {_money(total)}, the lowest landed cost that arrives in time"

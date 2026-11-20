@@ -4,7 +4,17 @@ search_offers(part_id) is the catalog: it shows listed_stock.
 recheck_offer(offer_id) is the live call: it shows live_stock.
 """
 
+import os
+
 import db
+
+# Simulated live supplier price shifts when SIMULATE_PRICE_CHANGE=1 (demo test switch)
+SIMULATED_LIVE_PRICES = {
+    "O1": 195.0,    # P01 OEM Direct: $175 -> $195
+    "O4": 31.0,     # P02 Broker A:   $28  -> $31
+    "O6": 105.0,    # P04 OEM Direct: $92  -> $105
+    "O9": 1240.0,   # P06 Broker A:   $1190 -> $1240
+}
 
 
 def search_offers(part_id):
@@ -36,4 +46,9 @@ def recheck_offer(offer_id):
             (offer_id,),
         ).fetchone()
     conn.close()
-    return dict(row) if row else None
+    if row is None:
+        return None
+    out = dict(row)
+    if os.getenv("SIMULATE_PRICE_CHANGE", "0").strip() == "1" and offer_id in SIMULATED_LIVE_PRICES:
+        out["unit_price"] = SIMULATED_LIVE_PRICES[offer_id]
+    return out

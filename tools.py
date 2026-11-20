@@ -224,6 +224,8 @@ class ToolSession:
                 "qty": q,
                 "live_stock": res.get("live_stock"),
                 "live_price": res.get("live_price"),
+                "listed_price": res.get("listed_price"),
+                "price_changed": bool(res.get("price_changed")),
                 "passed": bool(res.get("passed")),
                 "reason": res.get("reason", ""),
             }

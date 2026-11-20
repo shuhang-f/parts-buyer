@@ -176,8 +176,10 @@ _sidebar_part_names = (
 )
 _sidebar_part_ids = list(_sidebar_part_names.keys()) or ["P01", "P02", "P03", "P04", "P05", "P06", "P07", "P08"]
 
-if "part_limits" not in st.session_state:
-    st.session_state["part_limits"] = dict(DEFAULT_PART_LIMITS)
+if "part_limit_values" not in st.session_state:
+    st.session_state["part_limit_values"] = dict(DEFAULT_PART_LIMITS)
+if "selected_limit_parts" not in st.session_state:
+    st.session_state["selected_limit_parts"] = sorted(DEFAULT_PART_LIMITS.keys())
 if "selected_date" not in st.session_state:
     st.session_state["selected_date"] = default_today_date()
 
@@ -195,53 +197,37 @@ with st.sidebar:
 
     with st.container(border=True):
         st.markdown("**Part spending limits**")
-        st.caption("No global limit. Only parts listed below require approval if exceeded.")
-        current_limits = dict(st.session_state["part_limits"])
-        to_remove = None
-        for pid in sorted(current_limits.keys()):
-            col_val, col_rm = st.columns([4, 1])
-            with col_val:
-                new_val = st.number_input(
-                    f"{pid} {(_sidebar_part_names.get(pid) or '')[:18]} ($)".strip(),
-                    min_value=0,
-                    value=int(current_limits[pid]),
-                    step=100,
-                    key=f"limit_input_{pid}",
-                )
-                current_limits[pid] = float(new_val)
-            with col_rm:
-                st.markdown("<div style='height:1.85rem'></div>", unsafe_allow_html=True)
-                if st.button("✕", key=f"rm_limit_{pid}", help=f"Remove limit for {pid}"):
-                    to_remove = pid
-        if to_remove:
-            current_limits.pop(to_remove, None)
-            st.session_state["part_limits"] = current_limits
-            st.rerun()
-        st.session_state["part_limits"] = current_limits
-
-        unconfigured = [p for p in _sidebar_part_ids if p not in current_limits]
-        if unconfigured:
-            add_pid = st.selectbox(
-                "Add limit for part",
-                unconfigured,
-                format_func=lambda p: f"{p} {_sidebar_part_names.get(p, '')}".strip(),
-                key="add_limit_part",
+        selected_limit_parts = st.multiselect(
+            "Select parts to cap",
+            options=_sidebar_part_ids,
+            default=[p for p in st.session_state["selected_limit_parts"] if p in _sidebar_part_ids],
+            format_func=lambda p: f"{p} {_sidebar_part_names.get(p, '')}".strip(),
+            placeholder="Choose parts…",
+            help="No global limit. Selecting a part pops up its dollar cap right below; unselecting removes its cap.",
+        )
+        st.session_state["selected_limit_parts"] = selected_limit_parts
+        active_part_limits = {}
+        for pid in selected_limit_parts:
+            default_val = int(st.session_state["part_limit_values"].get(pid, 500))
+            val = st.number_input(
+                f"{pid} {(_sidebar_part_names.get(pid) or '')[:20]} limit ($)".strip(),
+                min_value=0,
+                value=default_val,
+                step=100,
+                key=f"limit_input_{pid}",
             )
-            add_c1, add_c2 = st.columns([2, 1.3])
-            with add_c1:
-                add_amt = st.number_input("Limit ($)", min_value=0, value=500, step=100, key="add_limit_amt")
-            with add_c2:
-                st.markdown("<div style='height:1.85rem'></div>", unsafe_allow_html=True)
-                if st.button("Add", key="add_limit_btn", width="stretch"):
-                    current_limits[add_pid] = float(add_amt)
-                    st.session_state["part_limits"] = current_limits
-                    st.rerun()
-
-    active_part_limits = dict(st.session_state["part_limits"])
+            st.session_state["part_limit_values"][pid] = float(val)
+            active_part_limits[pid] = float(val)
+        if not selected_limit_parts:
+            st.caption("No part caps set — all eligible orders place automatically.")
 
     mode = st.radio(
         "Mode", ["Agent", "Rules only"], horizontal=True,
         help="Agent: the AI shops and explains. Rules only: the same rules run without the AI.",
+    )
+    simulate_price_change = st.toggle(
+        "Simulate live price change",
+        help="Simulates suppliers changing live prices during the scan so Buy price updates in Pricing.",
     )
     crash_test = st.toggle("Crash test", help="Stops the run on purpose after 2 orders, to show a restart never orders twice.")
     run_clicked = st.button("Run agent", type="primary", width="stretch")
@@ -255,7 +241,8 @@ if reset_clicked:
     st.session_state.pop("last_result", None)
     st.session_state.pop("last_activity", None)
     st.session_state.pop("last_part_states", None)
-    st.session_state["part_limits"] = dict(DEFAULT_PART_LIMITS)
+    st.session_state["part_limit_values"] = dict(DEFAULT_PART_LIMITS)
+    st.session_state["selected_limit_parts"] = sorted(DEFAULT_PART_LIMITS.keys())
     st.session_state["selected_date"] = default_today_date()
     os.environ["TODAY"] = default_today_date().isoformat()
     if "db" in backend:
@@ -365,9 +352,11 @@ if run_clicked:
     elif module not in backend:
         st.session_state["flash"] = ("warning", f"backend not ready: {module}")
     else:
-        # The crash switch is read by the backend from CRASH_AFTER_ORDERS (SPEC section 7).
+        # The crash and price-change switches are read by the backend from env vars.
         previous_crash = os.environ.get("CRASH_AFTER_ORDERS")
+        previous_price_sim = os.environ.get("SIMULATE_PRICE_CHANGE")
         os.environ["CRASH_AFTER_ORDERS"] = "2" if crash_test else "0"
+        os.environ["SIMULATE_PRICE_CHANGE"] = "1" if simulate_price_change else "0"
         live_ran_this_pass = True
         try:
             if module == "agent":
@@ -481,10 +470,17 @@ if run_clicked:
                         sup = supplier_label(ev.get("supplier_id"))
                         tag = f"**{pid}**" if pid else f"**{ev.get('offer_id')}**"
                         if ev.get("passed"):
-                            add_log(
-                                f"🔎 {tag} — Live check passed for **{sup}** "
-                                f"({ev.get('live_stock')} in stock at {money(ev.get('live_price'))})"
-                            )
+                            if ev.get("price_changed"):
+                                add_log(
+                                    f"💲 {tag} — Live scan updated buy price for **{sup}**: "
+                                    f"{money(ev.get('listed_price'))} → **{money(ev.get('live_price'))}** "
+                                    f"({ev.get('live_stock')} in stock)"
+                                )
+                            else:
+                                add_log(
+                                    f"🔎 {tag} — Live check passed for **{sup}** "
+                                    f"({ev.get('live_stock')} in stock at {money(ev.get('live_price'))})"
+                                )
                         else:
                             add_log(
                                 f"⚠️ {tag} — Live check failed for **{sup}** "
@@ -600,6 +596,10 @@ if run_clicked:
                 os.environ.pop("CRASH_AFTER_ORDERS", None)
             else:
                 os.environ["CRASH_AFTER_ORDERS"] = previous_crash
+            if previous_price_sim is None:
+                os.environ.pop("SIMULATE_PRICE_CHANGE", None)
+            else:
+                os.environ["SIMULATE_PRICE_CHANGE"] = previous_price_sim
 
 # --- Data (fresh after any run/reset) --------------------------------------
 db_ready = db_usable()
@@ -647,8 +647,8 @@ if st.session_state.get("ran") and db_ready:
     )
 
 waiting_tab = f"Approvals ({awaiting})" if awaiting else "Approvals"
-tab_inv, tab_appr, tab_orders, tab_offers, tab_audit = st.tabs(
-    ["Inventory", waiting_tab, "Orders", "Bulk & Suppliers", "Audit trail"]
+tab_inv, tab_appr, tab_orders, tab_pricing, tab_audit = st.tabs(
+    ["Inventory", waiting_tab, "Orders", "Pricing", "Audit trail"]
 )
 
 # Inventory
@@ -807,85 +807,81 @@ with tab_orders:
         )
         st.caption("Daily order ID: one order per part per day, so a retry or restart can never order twice.")
 
-# Bulk & Suppliers
-with tab_offers:
+# Pricing (Buy price from agent scan + Sell price)
+with tab_pricing:
     if not db_ready:
         st.info("Press Reset demo")
     else:
-        offers_df = read_table(
-            "SELECT o.offer_id, o.part_id, o.supplier_id, s.name AS supplier_name, "
-            "o.unit_price, COALESCE(o.min_order_qty, 1) AS min_order_qty, o.bulk_unit_price, "
-            "s.shipping_flat, s.lead_time_days, o.listed_stock "
-            "FROM offers o JOIN suppliers s ON s.supplier_id = o.supplier_id "
-            "ORDER BY o.part_id, o.offer_id"
-        )
-        if offers_df is None or offers_df.empty:
-            st.caption("No supplier offers loaded.")
+        prices_df = read_table("SELECT part_id, name, buy_price, sell_price FROM parts ORDER BY part_id")
+        if prices_df is None or prices_df.empty:
+            st.caption("No pricing data loaded. Press Reset demo.")
         else:
-            st.caption(
-                "Minimum order batch (MOQ): when an offer has a minimum batch > 1, buying from that offer "
-                "orders at least the minimum batch at the bulk unit price."
+            scanned_changes = {}
+            if audit is not None and not audit.empty:
+                for _, r in audit[audit["step"] == "recheck"].iterrows():
+                    d = row_data(r)
+                    if d.get("passed") and d.get("price_changed") and r["part_id"]:
+                        scanned_changes[r["part_id"]] = (d.get("listed_price"), d.get("live_price"))
+
+            head = (
+                "<thead><tr><th>Part</th><th class='num'>Buy price</th>"
+                "<th class='num'>Sell price</th></tr></thead>"
             )
-            st.table(
-                pd.DataFrame(
-                    {
-                        "Offer": offers_df["offer_id"],
-                        "Part": [part_label(p) for p in offers_df["part_id"]],
-                        "Supplier": [str(n).replace(" (mock)", "") for n in offers_df["supplier_name"]],
-                        "Unit price": offers_df["unit_price"].map(money),
-                        "Min batch (MOQ)": offers_df["min_order_qty"].astype(int),
-                        "Bulk unit price": [
-                            money(v) if pd.notna(v) else "—" for v in offers_df["bulk_unit_price"]
-                        ],
-                        "Shipping": offers_df["shipping_flat"].map(money),
-                        "Lead time": [f"{int(d)}d" for d in offers_df["lead_time_days"]],
-                        "Catalog stock": offers_df["listed_stock"].astype(int),
-                    }
-                ).set_index("Offer")
-            )
-            with st.expander("Edit an offer's minimum batch / bulk discount", expanded=False):
-                offer_ids = list(offers_df["offer_id"])
-                offer_lookup = offers_df.set_index("offer_id").to_dict("index")
-                sel_oid = st.selectbox(
-                    "Offer",
-                    offer_ids,
-                    format_func=lambda oid: (
-                        f"{oid} — {part_label(offer_lookup[oid]['part_id'])} · "
-                        f"{str(offer_lookup[oid]['supplier_name']).replace(' (mock)', '')}"
-                    ),
+            body = []
+            for _, row in prices_df.iterrows():
+                pid = row["part_id"]
+                buy_v = float(row["buy_price"] or 0)
+                sell_v = float(row["sell_price"] or 0)
+                sub_note = ""
+                if pid in scanned_changes:
+                    old_p, new_p = scanned_changes[pid]
+                    sub_note = f"<span class='pb-why'>Updated by live scan ({money(old_p)} → {money(new_p)})</span>"
+                elif buy_v > 0 and sell_v > 0 and buy_v >= sell_v:
+                    sub_note = "<span class='pb-why' style='color:#d64541;opacity:1;'>Buy price meets or exceeds sell price</span>"
+                body.append(
+                    f"<tr><td><b>{pid}</b> {row['name']}{sub_note}</td>"
+                    f"<td class='num avail'>{money(buy_v)}</td>"
+                    f"<td class='num avail'>{money(sell_v)}</td></tr>"
                 )
-                cur = offer_lookup[sel_oid]
-                e1, e2, e3 = st.columns([1.2, 1.4, 1])
-                with e1:
-                    new_moq = st.number_input(
-                        "Min batch (MOQ)",
-                        min_value=1,
-                        value=int(cur["min_order_qty"] or 1),
-                        step=1,
-                        key=f"moq_edit_{sel_oid}",
-                    )
-                with e2:
-                    cur_bulk = 0.0 if pd.isna(cur["bulk_unit_price"]) else float(cur["bulk_unit_price"])
-                    new_bulk = st.number_input(
-                        "Bulk unit price ($; 0 = none)",
-                        min_value=0.0,
-                        value=cur_bulk,
-                        step=1.0,
-                        key=f"bulk_edit_{sel_oid}",
-                    )
-                with e3:
-                    st.markdown("<div style='height:1.85rem'></div>", unsafe_allow_html=True)
-                    if st.button("Save offer", key=f"save_offer_{sel_oid}", width="stretch"):
-                        try:
-                            backend["db"].update_offer_bulk(sel_oid, int(new_moq), new_bulk if new_bulk > 0 else None)
-                            st.session_state["flash"] = (
-                                "success",
-                                f"Updated {sel_oid}: min batch {int(new_moq)}"
-                                + (f", bulk price {money(new_bulk)}" if new_bulk > 0 else " (no bulk discount)") + ".",
-                            )
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(f"Could not update {sel_oid}: {exc}")
+            st.markdown(
+                f"<div class='pb-table-wrap'><table class='pb-table'>{head}<tbody>{''.join(body)}</tbody></table></div>",
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                "Buy price updates automatically from the agent's live supplier scan. "
+                "Toggle 'Simulate live price change' in the sidebar to test live price updates."
+            )
+
+            st.markdown("##### Edit sell price")
+            price_lookup = prices_df.set_index("part_id").to_dict("index")
+            p1, p2, p3 = st.columns([2.2, 1.3, 1])
+            with p1:
+                edit_pid = st.selectbox(
+                    "Part",
+                    list(prices_df["part_id"]),
+                    format_func=lambda p: f"{p} {price_lookup[p]['name']}",
+                    key="edit_sell_part",
+                )
+            with p2:
+                new_sell = st.number_input(
+                    "Sell price ($)",
+                    min_value=0.0,
+                    value=float(price_lookup[edit_pid]["sell_price"] or 0),
+                    step=5.0,
+                    key=f"edit_sell_val_{edit_pid}",
+                )
+            with p3:
+                st.markdown("<div style='height:1.85rem'></div>", unsafe_allow_html=True)
+                if st.button("Save price", key=f"save_sell_{edit_pid}", width="stretch"):
+                    try:
+                        backend["db"].update_part_sell_price(edit_pid, new_sell)
+                        st.session_state["flash"] = (
+                            "success",
+                            f"Updated sell price for {part_label(edit_pid)} to {money(new_sell)}.",
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not update sell price: {exc}")
 
 # Audit trail
 with tab_audit:

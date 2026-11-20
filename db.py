@@ -32,7 +32,9 @@ CREATE TABLE parts (
     on_order           INTEGER NOT NULL,
     reorder_point      INTEGER NOT NULL,
     reorder_qty        INTEGER NOT NULL,
-    approved_suppliers TEXT NOT NULL          -- split on ";"
+    approved_suppliers TEXT NOT NULL,         -- split on ";"
+    buy_price          REAL NOT NULL DEFAULT 0,
+    sell_price         REAL NOT NULL DEFAULT 0
 );
 CREATE TABLE suppliers (
     supplier_id    TEXT PRIMARY KEY,
@@ -89,7 +91,11 @@ INT_COLUMNS = {
     "offers": {"listed_stock", "live_stock", "min_order_qty"},
     "jobs": {"qty"},
 }
-REAL_COLUMNS = {"suppliers": {"shipping_flat"}, "offers": {"unit_price", "bulk_unit_price"}}
+REAL_COLUMNS = {
+    "parts": {"buy_price", "sell_price"},
+    "suppliers": {"shipping_flat"},
+    "offers": {"unit_price", "bulk_unit_price"},
+}
 NULLABLE_COLUMNS = {"offers": {"bulk_unit_price"}}
 
 
@@ -134,6 +140,27 @@ def update_offer_bulk(offer_id, min_order_qty, bulk_unit_price):
             "UPDATE offers SET min_order_qty = ?, bulk_unit_price = ? WHERE offer_id = ?",
             (moq, bulk, offer_id),
         )
+        conn.commit()
+    conn.close()
+
+
+def update_part_buy_price(part_id, buy_price, conn=None):
+    """Persist the latest scanned buy price for a part."""
+    val = round(float(buy_price), 2)
+    if conn is not None:
+        conn.execute("UPDATE parts SET buy_price = ? WHERE part_id = ?", (val, part_id))
+        return
+    with connect() as c:
+        c.execute("UPDATE parts SET buy_price = ? WHERE part_id = ?", (val, part_id))
+        c.commit()
+    c.close()
+
+
+def update_part_sell_price(part_id, sell_price):
+    """Update the shop's sell price for a part."""
+    val = max(0.0, round(float(sell_price), 2))
+    with connect() as conn:
+        conn.execute("UPDATE parts SET sell_price = ? WHERE part_id = ?", (val, part_id))
         conn.commit()
     conn.close()
 

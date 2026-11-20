@@ -1,9 +1,9 @@
-part_id,name,on_hand,reserved,on_order,reorder_point,reorder_qty,approved_suppliers
-P01,Battery pack 14.4V,2,2,0,3,4,OEMD;BRKA
-P02,Handpiece motor seal kit,3,0,0,4,10,OEMD;BRKA;BRKB
-P03,Drill chuck assembly,1,1,2,2,4,OEMD
-P04,Foot switch cable,0,1,0,2,3,OEMD;BRKB
-P05,Camera head cable,3,0,0,2,2,OEMD;BRKA
-P06,Light source lamp module,1,1,0,2,2,OEMD;BRKA
-P07,Shaver blade hub,6,0,0,3,5,BRKA;BRKB
-P08,Sterilization case latch,15,0,0,5,10,BRKB
+part_id,name,on_hand,reserved,on_order,reorder_point,reorder_qty,approved_suppliers,buy_price,sell_price
+P01,Battery pack 14.4V,2,2,0,3,4,OEMD;BRKA,175,245
+P02,Handpiece motor seal kit,3,0,0,4,10,OEMD;BRKA;BRKB,28,40
+P03,Drill chuck assembly,1,1,2,2,4,OEMD,110,155
+P04,Foot switch cable,0,1,0,2,3,OEMD;BRKB,92,130
+P05,Camera head cable,3,0,0,2,2,OEMD;BRKA,85,120
+P06,Light source lamp module,1,1,0,2,2,OEMD;BRKA,1190,1665
+P07,Shaver blade hub,6,0,0,3,5,BRKA;BRKB,65,90
+P08,Sterilization case latch,15,0,0,5,10,BRKB,18,25
