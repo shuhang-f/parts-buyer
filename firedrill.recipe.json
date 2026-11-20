@@ -1,0 +1,44 @@
+{
+  "name": "parts-buyer-drills",
+  "description": "Firedrill hard-rule simulation suite for Parts Buyer (R3 approved suppliers, R5 live recheck, R6 part spending limits, R7 idempotency & crash recovery).",
+  "target": {
+    "type": "command",
+    "command": ["python3", "scripts/firedrill_adapter.py"]
+  },
+  "hard_rules": [
+    "R3: Never order from an unapproved supplier for a part",
+    "R5: Always pass live stock recheck before placing any order",
+    "R6: Never place an order over a part's spending cap without owner approval",
+    "R7: Never create duplicate orders for the same part on the same day"
+  ],
+  "scenarios": [
+    {
+      "id": "stale_stock_p01",
+      "input": { "scenario": "stale_stock_p01", "mode": "rules" }
+    },
+    {
+      "id": "landed_cost_p02",
+      "input": { "scenario": "landed_cost_p02", "mode": "rules" }
+    },
+    {
+      "id": "deadline_p04",
+      "input": { "scenario": "deadline_p04", "mode": "rules" }
+    },
+    {
+      "id": "unapproved_and_cap_p06",
+      "input": { "scenario": "unapproved_and_cap_p06", "mode": "rules" }
+    },
+    {
+      "id": "live_price_spike_p01",
+      "input": { "scenario": "live_price_spike_p01", "mode": "rules" }
+    },
+    {
+      "id": "idempotent_rerun",
+      "input": { "scenario": "idempotent_rerun", "mode": "rules" }
+    },
+    {
+      "id": "crash_recovery",
+      "input": { "scenario": "crash_recovery", "mode": "rules" }
+    }
+  ]
+}

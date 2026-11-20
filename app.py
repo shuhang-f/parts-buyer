@@ -522,6 +522,14 @@ if run_clicked:
                             add_log(f"🛑 **{part_label(pid)}** — Order blocked: {plain_english(ev.get('reason'))}")
                         refresh_live_ui()
 
+                    elif etype == "memory_recalled" and pid:
+                        txt = str(ev.get("text") or "")
+                        short_txt = txt[:160] + ("…" if len(txt) > 160 else "")
+                        add_log(f"🧠 **{pid}** — Recalled from Cognee memory: _{short_txt}_")
+
+                    elif etype == "memory_saved":
+                        add_log(f"🧠 Saved **{ev.get('stored', 0)}** run lessons to Cognee Cloud memory")
+
                     elif etype == "reasoning_logged" and pid:
                         add_log(f"💬 **{pid}** — Saved plain-English explanation")
 
@@ -650,8 +658,8 @@ if st.session_state.get("ran") and db_ready:
     )
 
 waiting_tab = f"Approvals ({awaiting})" if awaiting else "Approvals"
-tab_inv, tab_appr, tab_orders, tab_pricing, tab_audit = st.tabs(
-    ["Inventory", waiting_tab, "Orders", "Pricing", "Audit trail"]
+tab_inv, tab_appr, tab_orders, tab_pricing, tab_sims, tab_audit = st.tabs(
+    ["Inventory", waiting_tab, "Orders", "Pricing", "Simulations", "Audit trail"]
 )
 
 # Inventory
@@ -949,6 +957,88 @@ with tab_pricing:
                     except Exception as exc:
                         st.error(f"Could not update sell price: {exc}")
 
+# Simulations (Firedrill hard-rule drills)
+with tab_sims:
+    st.markdown("#### Firedrill Simulation & Hard-Rule Scorecard")
+    st.caption(
+        "Runs isolated stress-test worlds (never touches your live demo DB) and scores every run against "
+        "hard rules: **R3** approved suppliers, **R5** live stock recheck, **R6** part spending caps, and **R7** zero duplicates. "
+        "Also wired via `firedrill.recipe.json` + `scripts/firedrill_adapter.py` for Firedrill CLI / MCP."
+    )
+    try:
+        import simulations as _sims
+
+        s_c1, s_c2 = st.columns([2, 1.4])
+        with s_c1:
+            sim_mode_label = st.radio(
+                "Simulation target",
+                ["Rules engine (fast, deterministic)", "Live AI Agent (calls LLM)"],
+                horizontal=True,
+                key="sim_mode_radio",
+            )
+            sim_mode = "agent" if "Agent" in sim_mode_label else "rules"
+        with s_c2:
+            st.markdown("<div style='height:1.45rem'></div>", unsafe_allow_html=True)
+            run_sims_clicked = st.button(
+                f"Run all {len(_sims.SCENARIOS)} drills",
+                type="primary",
+                width="stretch",
+                key="run_firedrill_suite",
+            )
+
+        if run_sims_clicked:
+            with st.status("Running Firedrill simulation suite…", expanded=True) as sim_status:
+                sim_results = []
+                sim_prog = st.progress(0.0, text="Starting simulations…")
+                total_drills = len(_sims.SCENARIOS)
+                for idx, sc in enumerate(_sims.SCENARIOS, start=1):
+                    sim_prog.progress((idx - 1) / total_drills, text=f"Running {idx}/{total_drills}: {sc['name']}…")
+                    res = _sims.run_drill(sc["id"], mode=sim_mode)
+                    sim_results.append(res)
+                    icon = "✅" if res["passed"] else "❌"
+                    sim_status.markdown(f"{icon} **{res['name']}** ({res['elapsed_ms']} ms)")
+                passed_n = sum(1 for r in sim_results if r["passed"])
+                viol_n = sum(len(r["hard_rule_violations"]) for r in sim_results)
+                sim_prog.progress(1.0, text=f"Finished {passed_n}/{total_drills} scenarios")
+                sim_status.update(
+                    label=f"Simulation suite complete — {passed_n}/{total_drills} passed, {viol_n} hard-rule violations",
+                    state="complete" if (passed_n == total_drills and viol_n == 0) else "error",
+                    expanded=False,
+                )
+                st.session_state["last_sim_report"] = {
+                    "mode": sim_mode,
+                    "total_scenarios": total_drills,
+                    "passed_scenarios": passed_n,
+                    "pass_rate_pct": round(100.0 * passed_n / max(total_drills, 1), 1),
+                    "hard_rule_violations": viol_n,
+                    "elapsed_ms": round(sum(r["elapsed_ms"] for r in sim_results), 1),
+                    "results": sim_results,
+                }
+
+        sim_report = st.session_state.get("last_sim_report")
+        if sim_report:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Scenarios passed", f"{sim_report['passed_scenarios']}/{sim_report['total_scenarios']}")
+            m2.metric("Pass rate", f"{sim_report['pass_rate_pct']}%")
+            m3.metric("Hard-rule violations", sim_report["hard_rule_violations"])
+            m4.metric("Runtime", f"{sim_report['elapsed_ms']} ms")
+            for r in sim_report["results"]:
+                badge = "✅ PASS" if r["passed"] else "❌ FAIL"
+                rules_tag = ", ".join(r["rules"])
+                with st.expander(f"{badge} · {r['name']}  ({rules_tag}) — {r['elapsed_ms']} ms", expanded=not r["passed"]):
+                    st.caption(r["description"])
+                    for chk in r["checks"]:
+                        st.markdown(f"{'✅' if chk['pass'] else '❌'} {chk['detail']}")
+                    if r["hard_rule_violations"]:
+                        for v in r["hard_rule_violations"]:
+                            st.error(v)
+                    else:
+                        st.success("0 hard-rule violations (R3, R5, R6, R7 verified)")
+        else:
+            st.info("Click **Run all 7 drills** above to test stale stock, landed cost, deadlines, caps, live price spikes, retries, and crash recovery.")
+    except Exception as exc:
+        st.warning(f"Simulations module unavailable: {exc}")
+
 # Audit trail
 with tab_audit:
     if not db_ready:
@@ -977,6 +1067,7 @@ with tab_audit:
                 if d.get("passed") is False and d.get("listed_stock") is not None
                 and d.get("live_stock") is not None and d["live_stock"] < d["listed_stock"]
             ]
+            recalled_rows = steps[steps["step"] == "recalled"]
             if pid in latest_order.index:
                 o = latest_order.loc[pid]
                 outcome = f"{STATUS_LABELS.get(o['status'], o['status'])}: {supplier_label(o['supplier_id'])}, {money(o['total'])}"
@@ -984,7 +1075,11 @@ with tab_audit:
                 outcome = "OK, nothing to buy"
             else:
                 outcome = "No order"
-            title = f"{part_label(pid)}  —  {outcome}" + ("  ⚠️ stale stock caught" if catches else "")
+            title = (
+                f"{part_label(pid)}  —  {outcome}"
+                + ("  ⚠️ stale stock caught" if catches else "")
+                + ("  🧠 memory" if not recalled_rows.empty else "")
+            )
             with st.expander(title, expanded=bool(catches)):
                 for d in catches:
                     st.warning(
@@ -992,6 +1087,8 @@ with tab_audit:
                         f"Catalog said {d['listed_stock']} in stock. Live check said {d['live_stock']}.",
                         icon="🔎",
                     )
+                for _, mem_row in recalled_rows.iterrows():
+                    st.info(f"**Recalled from Cognee memory:** {mem_row['message']}", icon="🧠")
                 show_details = st.toggle("Show raw data", key=f"details_{pid}")
                 for _, row in steps.iterrows():
                     label = STEP_LABELS.get(row["step"], str(row["step"]).replace("_", " ").capitalize())

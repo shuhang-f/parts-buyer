@@ -192,6 +192,14 @@ class ToolSession:
         for r in ev.get("rejected", []):
             if r.get("offer_id"):
                 self._offer_to_part[r["offer_id"]] = pid
+        if ev.get("recalled_memory"):
+            self._emit(
+                {
+                    "type": "memory_recalled",
+                    "part_id": pid,
+                    "text": ev["recalled_memory"],
+                }
+            )
         self._emit(
             {
                 "type": "part_evaluated",

@@ -299,6 +299,16 @@ def evaluate_part(part_id, run_id, spend_limit=None, part_limits=None):
               {"available": ev["available"], "on_hand": ev["on_hand"], "reserved": ev["reserved"],
                "on_order": ev["on_order"], "reorder_point": ev["reorder_point"], "qty": ev["qty"],
                "deadline": ev["deadline"], "job": ev["job"], "rule": "R1, R2"})
+    try:
+        import memory
+
+        if memory.is_enabled():
+            recalled = memory.recall_for_part(part_id, ev["name"], context=trigger)
+            if recalled and recalled.get("text"):
+                ev["recalled_memory"] = recalled["text"]
+                audit.log(run_id, part_id, "recalled", recalled["text"], recalled)
+    except Exception:
+        pass
     n_offers = len(ev["eligible_offers"]) + len(ev["rejected"])
     audit.log(run_id, part_id, "shopping",
               f"Found {n_offers} offers; {len(ev['eligible_offers'])} meet the rules.",
@@ -606,6 +616,14 @@ def run_rules_only(spend_limit=None, part_limits=None):
         summary.setdefault(outcome, []).append(part_id)
         if outcome == "placed" and crash_after > 0 and len(summary["placed"]) >= crash_after:
             raise RuntimeError("Simulated crash")
+    try:
+        import memory
+
+        if memory.is_enabled():
+            memory.seed_policy(background=True)
+            summary["memory_saved"] = memory.remember_run_lessons(run_id, audit.read_by_run(run_id))
+    except Exception:
+        pass
     return summary
 
 

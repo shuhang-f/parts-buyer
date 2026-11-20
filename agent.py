@@ -465,6 +465,25 @@ def run_agent(
 
     _ensure_agent_notes(session, run_id)
 
+    memory_saved = None
+    try:
+        import memory
+
+        if memory.is_enabled():
+            memory.seed_policy(background=True)
+            memory_saved = memory.remember_run_lessons(run_id, audit.read_by_run(run_id))
+            if memory_saved.get("stored"):
+                _emit(
+                    on_event,
+                    {
+                        "type": "memory_saved",
+                        "stored": memory_saved["stored"],
+                        "dataset": memory_saved.get("dataset"),
+                    },
+                )
+    except Exception:
+        pass
+
     summary = _summarize_run_from_db(run_id, limit)
     summary.update(
         {
@@ -472,6 +491,7 @@ def run_agent(
             "provider": provider,
             "model": active_model,
             "part_limits": part_limits,
+            "memory_saved": memory_saved,
             "turns": turns,
             "nudges": nudges,
             "recovered_parts": recovered_parts,
