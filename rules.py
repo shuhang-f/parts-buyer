@@ -32,19 +32,45 @@ import suppliers
 def get_spend_limit(override=None):
     """The one place the spending limit is read. override wins (sidebar box);
     otherwise Statsig via config_flags, otherwise SPEND_LIMIT in .env."""
+    return get_spend_limit_with_source(override)[0]
+
+
+def get_spend_limit_with_source(override=None):
+    """(limit, source). source is "app" (sidebar override), "Statsig", or ".env"
+    (the default), exactly as config_flags.get_live_limit() reports it."""
     if override is not None:
         limit = _valid_limit(override)
         if limit is None:
             raise ValueError(f"Spending limit must be a number of 0 or more (got {override!r})")
-        return limit
+        return limit, "app"
     try:
         from config_flags import get_live_limit
-        limit = _valid_limit(get_live_limit()[0])
+        value, source = get_live_limit()
+        limit = _valid_limit(value)
+        if limit is not None:
+            return limit, source
     except Exception:
-        limit = None
+        pass
+    limit = _valid_limit(os.getenv("SPEND_LIMIT", "1000"))
+    return (1000.0 if limit is None else limit), ".env"
+
+
+LIMIT_SOURCE_WORDS = {
+    "Statsig": "set in Statsig",
+    ".env": "the default limit",
+    "app": "set in the app",
+    "part_cap": "part cap set in the app",
+}
+
+
+def _limit_phrase(total, limit, source):
+    """'Total $2,395 is over your $1,000 limit (set in Statsig), so it needs your approval.'"""
     if limit is None:
-        limit = _valid_limit(os.getenv("SPEND_LIMIT", "1000"))
-    return 1000.0 if limit is None else limit
+        return f"Total {_money(total)} (no spending cap on this part)."
+    where = LIMIT_SOURCE_WORDS.get(source, source or "set in the app")
+    if total <= limit:                                                        # R6, same test as place_order
+        return f"Total {_money(total)} is within your {_money(limit)} limit ({where})."
+    return f"Total {_money(total)} is over your {_money(limit)} limit ({where}), so it needs your approval."
 
 
 def _valid_limit(value):
@@ -82,22 +108,23 @@ def _supplier_name(name):
 
 
 # ------------------------------------------------------------------- reads --
-def _limit_for_part(part_id, spend_limit=None, part_limits=None):
-    """Resolve the spending limit for one part.
+def _limit_for_part(part_id, spend_limit=None, part_limits=None, limit_source=None):
+    """Resolve (limit, source) for one part.
 
     When part_limits is provided (dict of {part_id: dollar_limit}), ONLY parts
-    present in part_limits have a cap; all other parts return None (no limit).
-    When part_limits is None, falls back to get_spend_limit(spend_limit).
+    present in part_limits have a cap; all other parts return (None, 'none').
+    When part_limits is None, falls back to get_spend_limit_with_source(spend_limit).
     """
     if part_limits is not None:
         raw = part_limits.get(part_id)
         if raw is None:
-            return None
+            return None, "none"
         limit = _valid_limit(raw)
         if limit is None:
             raise ValueError(f"Spending limit for {part_id} must be a number of 0 or more (got {raw!r})")
-        return limit
-    return get_spend_limit(spend_limit)
+        return limit, (limit_source or "part_cap")
+    limit, source = get_spend_limit_with_source(spend_limit)
+    return limit, (limit_source or source)
 
 
 def _part(conn, part_id):
@@ -161,7 +188,7 @@ def get_inventory_status():
 
 
 # ---------------------------------------------------------------- evaluate --
-def _evaluate(part_id, spend_limit=None, part_limits=None):
+def _evaluate(part_id, spend_limit=None, part_limits=None, limit_source=None):
     """R1 to R4 for one part. No side effects. Used by evaluate_part (which logs)
     and by place_order (which re-validates)."""
     conn = db.connect()
@@ -171,7 +198,9 @@ def _evaluate(part_id, spend_limit=None, part_limits=None):
         existing = _order_for_key(conn, idempotency_key(part_id))
     finally:
         conn.close()
-    limit = _limit_for_part(part_id, spend_limit=spend_limit, part_limits=part_limits)
+    limit, source = _limit_for_part(
+        part_id, spend_limit=spend_limit, part_limits=part_limits, limit_source=limit_source
+    )
 
     ev = {
         "part_id": part_id,
@@ -187,6 +216,7 @@ def _evaluate(part_id, spend_limit=None, part_limits=None):
         "deadline": None,
         "job": job,
         "spend_limit": limit,
+        "spend_limit_source": source,
         "eligible_offers": [],
         "rejected": [],
     }
@@ -413,8 +443,11 @@ def _refuse(run_id, part_id, reason, data):
     return {"status": "refused", "po_id": None, "reason": reason}
 
 
-def place_order(part_id, offer_id, qty, run_id, spend_limit=None, part_limits=None):
+def place_order(part_id, offer_id, qty, run_id, spend_limit=None, part_limits=None, limit_source=None):
     """R3 to R7 enforced in code before anything is written.
+
+    limit_source: pass the source from get_spend_limit_with_source() when you
+    pass an already-resolved spend_limit, so the audit trail names it correctly.
 
     Returns {"status": "placed" | "pending_approval" | "refused" | "exists",
              "po_id", "reason", ...}.
@@ -424,8 +457,9 @@ def place_order(part_id, offer_id, qty, run_id, spend_limit=None, part_limits=No
     run's audit log (R5). Logs chosen, then order_placed or approval_requested.
     """
     data = {"offer_id": offer_id, "qty": qty}
-    ev = _evaluate(part_id, spend_limit, part_limits=part_limits)
+    ev = _evaluate(part_id, spend_limit, part_limits=part_limits, limit_source=limit_source)
     limit = ev["spend_limit"]
+    source = ev["spend_limit_source"]
     key = idempotency_key(part_id)
 
     if ev["existing_order"]:                                                  # R7 check 1
@@ -470,6 +504,7 @@ def place_order(part_id, offer_id, qty, run_id, spend_limit=None, part_limits=No
         if offer.get("bulk_applied")
         else (f" (minimum batch {offer['min_order_qty']})" if offer.get("min_order_qty", 1) > 1 else "")
     )
+    limit_text = _limit_phrase(total, limit, source)
 
     conn = db.connect()
     try:
@@ -482,7 +517,8 @@ def place_order(part_id, offer_id, qty, run_id, spend_limit=None, part_limits=No
         po_id = _next_po_id(conn)
         row_data = {"po_id": po_id, "idempotency_key": key, "supplier_id": offer["supplier_id"],
                     "offer_id": offer_id, "qty": qty, "unit_price": unit_price, "shipping": shipping,
-                    "total": total, "spend_limit": limit, "arrival": offer["arrival"],
+                    "total": total, "spend_limit": limit, "spend_limit_source": source,
+                    "arrival": offer["arrival"],
                     "min_order_qty": offer.get("min_order_qty", 1),
                     "bulk_applied": bool(offer.get("bulk_applied"))}
         try:
@@ -505,27 +541,21 @@ def place_order(part_id, offer_id, qty, run_id, spend_limit=None, part_limits=No
         audit.log(run_id, part_id, "chosen",
                   f"Chose {offer['supplier_name']}{bulk_note}: {qty} x {_money(unit_price)} + "
                   f"{_money(shipping)} shipping = {_money(total)}, the lowest landed cost that arrives in time"
-                  f"{' and passed the recheck' if cheaper else ''}.{why}",
-                  {**row_data, "rule": "R4"}, conn=conn)
+                  f"{' and passed the recheck' if cheaper else ''}.{why} {limit_text}",
+                  {**row_data, "rule": "R4, R6"}, conn=conn)
         if status == "placed":
             conn.execute("UPDATE parts SET on_order = on_order + ? WHERE part_id = ?", (qty, part_id))
-            limit_clause = (
-                f"within the {_money(limit)} limit"
-                if limit is not None
-                else "no spending limit on this part"
-            )
-            msg = (f"Placed {po_id} with {offer['supplier_name']}: {_money(total)}, {limit_clause}. "
-                   f"{qty} added to on order.")
+            msg = f"Placed {po_id} with {offer['supplier_name']}. {limit_text} {qty} added to on order."
             audit.log(run_id, part_id, "order_placed", msg, {**row_data, "rule": "R6, R7"}, conn=conn)
         else:
-            msg = (f"{_money(total)} is over the {_money(limit)} spending limit for {part_id}. {po_id} with "
-                   f"{offer['supplier_name']} is waiting for the owner's approval.")
+            msg = f"{limit_text} {po_id} with {offer['supplier_name']} is waiting for the owner's approval."
             audit.log(run_id, part_id, "approval_requested", msg, {**row_data, "rule": "R6"}, conn=conn)
         conn.commit()
     finally:
         conn.close()
     return {"status": status, "po_id": po_id, "reason": msg, "total": total,
-            "spend_limit": limit, "supplier_id": offer["supplier_id"],
+            "spend_limit": limit, "spend_limit_source": source,
+            "supplier_id": offer["supplier_id"],
             "min_order_qty": offer.get("min_order_qty", 1),
             "bulk_applied": bool(offer.get("bulk_applied"))}
 
@@ -573,15 +603,20 @@ def reject_order(po_id, approver="owner"):
 
 
 # --------------------------------------------------------------------- run --
-def run_rules_only(spend_limit=None, part_limits=None):
+def run_rules_only(spend_limit=None, part_limits=None, limit_source=None):
     """Section 7: every part in part_id order, using the same public functions
     the agent tools wrap. spend_limit overrides the live/.env limit when
     part_limits is not provided. Raises "Simulated crash" when
     CRASH_AFTER_ORDERS is reached; everything written before stays."""
     run_id = start_run()
-    limit = None if part_limits is not None else get_spend_limit(spend_limit)
+    if part_limits is not None:
+        limit, source = None, (limit_source or "part_cap")
+    else:
+        limit, source = get_spend_limit_with_source(spend_limit)
+        source = limit_source or source
     crash_after = _crash_after()
-    summary = {"run_id": run_id, "spend_limit": limit, "part_limits": part_limits, "today": db.today(),
+    summary = {"run_id": run_id, "spend_limit": limit, "spend_limit_source": source,
+               "part_limits": part_limits, "today": db.today(),
                "placed": [], "pending_approval": [], "skipped": [], "checked": [],
                "no_viable_offer": [], "refused": []}
 
@@ -605,7 +640,8 @@ def run_rules_only(spend_limit=None, part_limits=None):
             if not recheck_offer(offer["offer_id"], order_qty, run_id)["passed"]:    # R5
                 continue
             outcome = place_order(
-                part_id, offer["offer_id"], order_qty, run_id, spend_limit=limit, part_limits=part_limits
+                part_id, offer["offer_id"], order_qty, run_id,
+                spend_limit=limit, part_limits=part_limits, limit_source=source,
             )["status"]
             break
         else:

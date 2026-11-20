@@ -299,7 +299,18 @@ def _ensure_agent_notes(session: ToolSession, run_id: str) -> None:
             session.log_reasoning(pid, _fallback_note(pid, part_entries))
 
 
-def _limit_rule_text(limit: float | None, part_limits: dict[str, float] | None) -> str:
+def _resolve_limit_with_source(
+    spend_limit: float | None,
+    part_limits: dict[str, float] | None,
+) -> tuple[float | None, str]:
+    if part_limits is not None:
+        return None, "part_cap"
+    if hasattr(rules, "get_spend_limit_with_source"):
+        return rules.get_spend_limit_with_source(spend_limit)
+    return rules.get_spend_limit(spend_limit), ("app" if spend_limit is not None else ".env")
+
+
+def _limit_rule_text(limit: float | None, part_limits: dict[str, float] | None, source: str = ".env") -> str:
     if part_limits is not None:
         if not part_limits:
             return "There is no global spending limit and no part-specific spending limits are set."
@@ -308,7 +319,8 @@ def _limit_rule_text(limit: float | None, part_limits: dict[str, float] | None) 
             f"There is no global spending limit. Part-specific spending limits apply only to: {pairs}. "
             "All other parts have no spending cap."
         )
-    return f"The owner's spending limit per order is ${_format_limit(float(limit or 0))}."
+    src_note = f" (set in {source})" if source == "Statsig" else ""
+    return f"The owner's spending limit per order is ${_format_limit(float(limit or 0))}{src_note}."
 
 
 def run_agent(
@@ -327,7 +339,7 @@ def run_agent(
         )
 
     run_id = rules.start_run()
-    limit = None if part_limits is not None else rules.get_spend_limit(spend_limit)
+    limit, limit_source = _resolve_limit_with_source(spend_limit, part_limits)
     today_str = db.today()
     all_part_ids = [p["part_id"] for p in rules.get_inventory_status()]
 
@@ -340,6 +352,7 @@ def run_agent(
             "provider": provider,
             "model": model_name,
             "spend_limit": limit,
+            "spend_limit_source": limit_source,
             "part_limits": part_limits,
             "today": today_str,
             "part_ids": all_part_ids,
@@ -349,12 +362,13 @@ def run_agent(
     session = ToolSession(
         run_id=run_id,
         spend_limit=limit,
+        limit_source=limit_source,
         part_limits=part_limits,
         on_event=on_event,
     )
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         TODAY=today_str,
-        LIMIT_RULE=_limit_rule_text(limit, part_limits),
+        LIMIT_RULE=_limit_rule_text(limit, part_limits, limit_source),
     )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -490,6 +504,7 @@ def run_agent(
             "mode": "agent",
             "provider": provider,
             "model": active_model,
+            "spend_limit_source": limit_source,
             "part_limits": part_limits,
             "memory_saved": memory_saved,
             "turns": turns,
@@ -516,9 +531,17 @@ def run_explain_only(
     part_limits: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Plan B: run rules_only first, then make one model call per gap part to explain in plain English."""
-    limit = None if part_limits is not None else rules.get_spend_limit(spend_limit)
+    import inspect as _inspect
+
+    limit, limit_source = _resolve_limit_with_source(spend_limit, part_limits)
     start_ts = time.perf_counter()
-    summary = rules.run_rules_only(spend_limit=limit, part_limits=part_limits)
+    r_kw: dict[str, Any] = {"spend_limit": limit}
+    r_params = _inspect.signature(rules.run_rules_only).parameters
+    if "part_limits" in r_params:
+        r_kw["part_limits"] = part_limits
+    if "limit_source" in r_params:
+        r_kw["limit_source"] = limit_source
+    summary = rules.run_rules_only(**r_kw)
     run_id = summary["run_id"]
 
     provider, api_key, base_url, model_name = _get_llm_config(model)

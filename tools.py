@@ -138,19 +138,24 @@ def _normalize_offer_id(raw: Any) -> str:
     return m.group(1) if m else text
 
 
+import inspect
+
+
 class ToolSession:
-    """Binds one agent run's run_id, spending limits, crash switch, and optional event hook."""
+    """Binds one agent run's run_id, spending limits, limit_source, crash switch, and optional event hook."""
 
     def __init__(
         self,
         *,
         run_id: str,
         spend_limit: float | None = None,
+        limit_source: str | None = None,
         part_limits: dict[str, float] | None = None,
         on_event: EventCallback | None = None,
     ) -> None:
         self.run_id = run_id
         self.spend_limit = None if spend_limit is None else float(spend_limit)
+        self.limit_source = limit_source
         self.part_limits = part_limits
         self.crash_after = _crash_after()
         self.orders_placed_this_run = 0
@@ -180,12 +185,11 @@ class ToolSession:
     def evaluate_part(self, part_id: str) -> dict[str, Any]:
         pid = _normalize_part_id(part_id)
         self._emit({"type": "part_start", "part_id": pid})
-        ev = rules.evaluate_part(
-            pid,
-            self.run_id,
-            spend_limit=self.spend_limit,
-            part_limits=self.part_limits,
-        )
+        ev_kwargs: dict[str, Any] = {"spend_limit": self.spend_limit}
+        ev_params = inspect.signature(rules.evaluate_part).parameters
+        if "part_limits" in ev_params:
+            ev_kwargs["part_limits"] = self.part_limits
+        ev = rules.evaluate_part(pid, self.run_id, **ev_kwargs)
         for o in ev.get("eligible_offers", []):
             if o.get("offer_id"):
                 self._offer_to_part[o["offer_id"]] = pid
@@ -212,6 +216,7 @@ class ToolSession:
                 "qty": ev.get("qty", 0),
                 "deadline": ev.get("deadline"),
                 "spend_limit": ev.get("spend_limit"),
+                "spend_limit_source": ev.get("spend_limit_source", self.limit_source),
                 "eligible_offers": ev.get("eligible_offers", []),
                 "rejected": ev.get("rejected", []),
                 "action": ev.get("action", ""),
@@ -244,14 +249,13 @@ class ToolSession:
         pid = _normalize_part_id(part_id)
         oid = _normalize_offer_id(offer_id)
         q = int(qty)
-        res = rules.place_order(
-            pid,
-            oid,
-            q,
-            self.run_id,
-            spend_limit=self.spend_limit,
-            part_limits=self.part_limits,
-        )
+        po_kwargs: dict[str, Any] = {"spend_limit": self.spend_limit}
+        po_params = inspect.signature(rules.place_order).parameters
+        if "part_limits" in po_params:
+            po_kwargs["part_limits"] = self.part_limits
+        if "limit_source" in po_params and self.limit_source is not None:
+            po_kwargs["limit_source"] = self.limit_source
+        res = rules.place_order(pid, oid, q, self.run_id, **po_kwargs)
         self._emit(
             {
                 "type": "order_result",
@@ -262,6 +266,7 @@ class ToolSession:
                 "po_id": res.get("po_id"),
                 "total": res.get("total"),
                 "spend_limit": res.get("spend_limit"),
+                "spend_limit_source": res.get("spend_limit_source", self.limit_source),
                 "supplier_id": res.get("supplier_id"),
                 "min_order_qty": res.get("min_order_qty", 1),
                 "bulk_applied": bool(res.get("bulk_applied")),

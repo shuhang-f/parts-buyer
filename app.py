@@ -203,26 +203,60 @@ with st.sidebar:
     st.session_state["selected_date"] = selected_date
     os.environ["TODAY"] = selected_date.isoformat()
 
-    with st.container(border=True):
-        st.markdown("**Part spending limits**")
-        active_part_limits = {
-            pid: float(st.session_state["part_limit_values"].get(pid, 500))
-            for pid in sorted(st.session_state["selected_limit_parts"])
-            if pid in _sidebar_part_ids
-        }
-        if active_part_limits:
-            chips = "".join(
-                f"<span class='pb-cap-badge' style='margin:0.15rem 0.25rem 0.15rem 0;'>"
-                f"{pid}: {money(val)}</span>"
-                for pid, val in active_part_limits.items()
+    statsig_enabled = os.getenv("USE_STATSIG", "0").strip() == "1"
+    use_statsig_live = False
+    statsig_live_limit = None
+    statsig_live_source = ".env"
+
+    if statsig_enabled:
+        try:
+            from config_flags import get_live_limit
+
+            statsig_live_limit, statsig_live_source = get_live_limit()
+        except Exception as exc:
+            statsig_live_limit, statsig_live_source = float(os.getenv("SPEND_LIMIT", "1000")), ".env"
+            st.warning(f"backend not ready: config_flags ({exc})")
+        with st.container(border=True):
+            st.markdown("**Live rules (Statsig)**")
+            use_statsig_live = st.toggle(
+                "Use Statsig live limit",
+                value=True,
+                key="use_statsig_live_toggle",
+                help="ON: Statsig controls the spending limit live (polled every 2s). OFF: use per-part caps from Inventory.",
             )
-            st.markdown(chips, unsafe_allow_html=True)
-            st.caption("Click any part in **Inventory** to edit or remove its cap.")
-            if st.button("Clear all caps", key="clear_all_caps", width="stretch"):
-                st.session_state["selected_limit_parts"] = []
+            st.markdown(f"Spending limit: **{money(statsig_live_limit)}**")
+            if statsig_live_source == "Statsig":
+                st.caption("Set in Statsig · refreshes every 2 s.")
+            else:
+                st.caption(":orange[Couldn't reach Statsig; using default limit.]")
+            if st.button("Refresh limit", key="refresh_statsig_btn", width="stretch"):
                 st.rerun()
-        else:
-            st.caption("No part caps set. Click any part in **Inventory** to add a spending limit.")
+
+    active_part_limits = {
+        pid: float(st.session_state["part_limit_values"].get(pid, 500))
+        for pid in sorted(st.session_state["selected_limit_parts"])
+        if pid in _sidebar_part_ids
+    }
+    if not use_statsig_live:
+        with st.container(border=True):
+            st.markdown("**Part spending limits**")
+            if active_part_limits:
+                chips = "".join(
+                    f"<span class='pb-cap-badge' style='margin:0.15rem 0.25rem 0.15rem 0;'>"
+                    f"{pid}: {money(val)}</span>"
+                    for pid, val in active_part_limits.items()
+                )
+                st.markdown(chips, unsafe_allow_html=True)
+                st.caption("Click any part in **Inventory** to edit or remove its cap.")
+                if st.button("Clear all caps", key="clear_all_caps", width="stretch"):
+                    st.session_state["selected_limit_parts"] = []
+                    st.rerun()
+            else:
+                st.caption("No part caps set. Click any part in **Inventory** to add a spending limit.")
+            if not statsig_enabled:
+                st.caption("Statsig live rules: set `USE_STATSIG=1` & `STATSIG_SERVER_SECRET` in env.")
+
+    run_part_limits = None if use_statsig_live else active_part_limits
 
     mode = st.radio(
         "Mode", ["Agent", "Rules only"], horizontal=True,
@@ -394,6 +428,7 @@ if run_clicked:
                             part_states.setdefault(p, "queued")
                         model_txt = ev.get("model") or "model"
                         pl = ev.get("part_limits")
+                        src = ev.get("spend_limit_source")
                         if pl is not None:
                             lim_txt = (
                                 ", ".join(f"{k}: {money(v)}" for k, v in sorted(pl.items()))
@@ -401,7 +436,9 @@ if run_clicked:
                                 else "no part caps"
                             )
                         else:
-                            lim_txt = money(ev.get("spend_limit", 1000))
+                            lim_txt = money(ev.get("spend_limit", 1000)) + (
+                                f" (set in {src})" if src == "Statsig" else ""
+                            )
                         add_log(
                             f"🚀 **Started run** (`{model_txt}`) · date **{ev.get('today', os.environ.get('TODAY'))}** · limits: **{lim_txt}**"
                         )
@@ -1150,7 +1187,9 @@ if st.session_state.get("last_result"):
                 lim_str = ", ".join(f"{k}: {money(v)}" for k, v in sorted(pl.items())) if pl else "None"
                 meta_bits.append(f"Part limits: {lim_str}")
             elif result.get("spend_limit") is not None:
-                meta_bits.append(f"Spending limit: {money(result['spend_limit'])}")
+                src = result.get("spend_limit_source")
+                src_txt = f" (set in {src})" if src == "Statsig" else ""
+                meta_bits.append(f"Spending limit: {money(result['spend_limit'])}{src_txt}")
             st.markdown(f"<span class='pb-meta'>{' · '.join(meta_bits)}</span>", unsafe_allow_html=True)
 
     saved_activity = st.session_state.get("last_activity")

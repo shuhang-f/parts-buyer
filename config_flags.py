@@ -8,8 +8,8 @@ This file only fetches a number. It never decides anything about money;
 rules.py does. It never raises: any problem logs "sponsor_error" and falls
 back to .env.
 
-Freshness: one Statsig client per process, polling Statsig every 10 seconds
-in the background, so a console change shows up within about 10 seconds.
+Freshness: one Statsig client per process, polling Statsig every 2 seconds
+in the background, so a console change shows up within about 2 seconds.
 SDK: statsig-python-core (import statsig_python_core).
 """
 
@@ -27,7 +27,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 CONFIG_NAME = "parts_buyer_rules"
 FIELD = "spend_limit"
-SYNC_INTERVAL_MS = 10_000   # background poll; console changes land within ~10 s
+SYNC_INTERVAL_MS = 2_000    # background poll; console changes land within ~2 s
 INIT_TIMEOUT_MS = 3_000     # never hold up a run for long if Statsig is down
 RETRY_AFTER_S = 30          # if the first connect failed, try again after this
 
