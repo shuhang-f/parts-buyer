@@ -37,11 +37,11 @@ st.markdown(
     [data-testid="stExpander"] summary p { font-size: 1.15rem; font-weight: 600; }
     [data-testid="stTable"] td, [data-testid="stTable"] th { font-size: 1.05rem; }
     .pb-summary { font-size: 1.6rem; font-weight: 700; margin: 0.2rem 0 0.8rem; }
-    .pb-table-wrap { max-height: 540px; overflow-y: auto; border: 1px solid rgba(128,128,128,.25); border-radius: 10px; }
-    .pb-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 1.05rem; }
-    .pb-table thead th { position: sticky; top: 0; z-index: 5; text-align: left; padding: 0.6rem 0.65rem; background: var(--secondary-background-color, #f0f2f6); border-bottom: 2px solid rgba(128,128,128,.5); }
+    .pb-table-wrap { max-height: 540px; overflow-y: auto; overflow-x: auto; border: 1px solid rgba(128,128,128,.3); border-radius: 10px; }
+    .pb-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 1.02rem; }
+    .pb-table thead th { position: sticky; top: 0; z-index: 5; text-align: left; padding: 0.6rem 0.65rem; background: #1f2430; color: #f5f7fa; border-bottom: 2px solid rgba(148,163,184,.45); }
     .pb-table td { padding: 0.55rem 0.65rem; border-bottom: 1px solid rgba(128,128,128,.22); vertical-align: top; }
-    .pb-table td:first-child { min-width: 17rem; }
+    .pb-table td:first-child { min-width: 14rem; }
     .pb-table td.num, .pb-table thead th.num { text-align: right; font-variant-numeric: tabular-nums; }
     .pb-table td.avail { font-weight: 800; font-size: 1.2rem; }
     .pb-why { display: block; font-size: 0.92rem; opacity: 0.75; margin-top: 0.15rem; }
