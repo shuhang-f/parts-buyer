@@ -37,15 +37,23 @@ st.markdown(
     [data-testid="stExpander"] summary p { font-size: 1.15rem; font-weight: 600; }
     [data-testid="stTable"] td, [data-testid="stTable"] th { font-size: 1.05rem; }
     .pb-summary { font-size: 1.6rem; font-weight: 700; margin: 0.2rem 0 0.8rem; }
-    .pb-table-wrap { max-height: 540px; overflow-y: auto; overflow-x: auto; border: 1px solid rgba(128,128,128,.3); border-radius: 10px; }
+    .pb-table-wrap { overflow-x: auto; border: 1px solid rgba(128,128,128,.25); border-radius: 10px; }
     .pb-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 1.02rem; }
-    .pb-table thead th { position: sticky; top: 0; z-index: 5; text-align: left; padding: 0.6rem 0.65rem; background: #1f2430; color: #f5f7fa; border-bottom: 2px solid rgba(148,163,184,.45); }
+    .pb-table thead th { text-align: left; padding: 0.6rem 0.65rem; background: #1f2430; color: #f5f7fa; border-bottom: 2px solid rgba(148,163,184,.45); }
     .pb-table td { padding: 0.55rem 0.65rem; border-bottom: 1px solid rgba(128,128,128,.22); vertical-align: top; }
     .pb-table td:first-child { min-width: 14rem; }
     .pb-table td.num, .pb-table thead th.num { text-align: right; font-variant-numeric: tabular-nums; }
     .pb-table td.avail { font-weight: 800; font-size: 1.2rem; }
-    .pb-why { display: block; font-size: 0.92rem; opacity: 0.75; margin-top: 0.15rem; }
-    .pb-pill { padding: 0.1rem 0.55rem; border-radius: 999px; font-weight: 700; font-size: 0.95rem; white-space: nowrap; }
+    .pb-inv-head { background: #1f2430; color: #f5f7fa; border-radius: 8px; padding: 0.5rem 0.7rem; font-weight: 700; font-size: 0.96rem; margin-bottom: 0.35rem; }
+    .pb-inv-head-grid { display: grid; grid-template-columns: 3.8fr 0.85fr 0.95fr 0.85fr 0.95fr 1fr 1.4fr; gap: 0.5rem; align-items: center; }
+    .pb-inv-head-grid .num { text-align: right; }
+    .pb-cell-num { text-align: right; font-variant-numeric: tabular-nums; padding-top: 0.35rem; font-size: 1.04rem; }
+    .pb-cell-avail { text-align: right; font-variant-numeric: tabular-nums; padding-top: 0.28rem; font-weight: 800; font-size: 1.2rem; }
+    .pb-cell-status { padding-top: 0.3rem; }
+    .pb-row-sep { border: none; border-top: 1px solid rgba(128,128,128,.2); margin: 0.25rem 0 0.35rem; }
+    .pb-cap-badge { display: inline-block; margin-left: 0.35rem; padding: 0.05rem 0.45rem; border-radius: 999px; font-size: 0.82rem; font-weight: 700; background: rgba(230,160,0,.22); color: #d99b00; }
+    .pb-why { display: block; font-size: 0.9rem; opacity: 0.75; margin-top: 0.05rem; }
+    .pb-pill { padding: 0.1rem 0.55rem; border-radius: 999px; font-weight: 700; font-size: 0.92rem; white-space: nowrap; }
     .pb-ok { background: rgba(33,150,83,.18); color: #1b7f46; }
     .pb-short { background: rgba(214,69,65,.16); color: #b3261e; }
     .pb-ordered { background: rgba(30,110,220,.16); color: #1a5fb4; }
@@ -197,29 +205,24 @@ with st.sidebar:
 
     with st.container(border=True):
         st.markdown("**Part spending limits**")
-        selected_limit_parts = st.multiselect(
-            "Select parts to cap",
-            options=_sidebar_part_ids,
-            default=[p for p in st.session_state["selected_limit_parts"] if p in _sidebar_part_ids],
-            format_func=lambda p: f"{p} {_sidebar_part_names.get(p, '')}".strip(),
-            placeholder="Choose parts…",
-            help="No global limit. Selecting a part pops up its dollar cap right below; unselecting removes its cap.",
-        )
-        st.session_state["selected_limit_parts"] = selected_limit_parts
-        active_part_limits = {}
-        for pid in selected_limit_parts:
-            default_val = int(st.session_state["part_limit_values"].get(pid, 500))
-            val = st.number_input(
-                f"{pid} {(_sidebar_part_names.get(pid) or '')[:20]} limit ($)".strip(),
-                min_value=0,
-                value=default_val,
-                step=100,
-                key=f"limit_input_{pid}",
+        active_part_limits = {
+            pid: float(st.session_state["part_limit_values"].get(pid, 500))
+            for pid in sorted(st.session_state["selected_limit_parts"])
+            if pid in _sidebar_part_ids
+        }
+        if active_part_limits:
+            chips = "".join(
+                f"<span class='pb-cap-badge' style='margin:0.15rem 0.25rem 0.15rem 0;'>"
+                f"{pid}: {money(val)}</span>"
+                for pid, val in active_part_limits.items()
             )
-            st.session_state["part_limit_values"][pid] = float(val)
-            active_part_limits[pid] = float(val)
-        if not selected_limit_parts:
-            st.caption("No part caps set — all eligible orders place automatically.")
+            st.markdown(chips, unsafe_allow_html=True)
+            st.caption("Click any part in **Inventory** to edit or remove its cap.")
+            if st.button("Clear all caps", key="clear_all_caps", width="stretch"):
+                st.session_state["selected_limit_parts"] = []
+                st.rerun()
+        else:
+            st.caption("No part caps set. Click any part in **Inventory** to add a spending limit.")
 
     mode = st.radio(
         "Mode", ["Agent", "Rules only"], horizontal=True,
@@ -674,6 +677,46 @@ def available_line(p):
     return f"{sums}, {verdict}"
 
 
+@st.dialog("Part spending limit")
+def edit_part_limit_dialog(pid):
+    name = part_names.get(pid, pid)
+    st.markdown(f"#### {pid} · {name}")
+    currently_capped = pid in st.session_state["selected_limit_parts"]
+    enable_cap = st.toggle(
+        "Require owner approval above spending limit",
+        value=currently_capped,
+        key=f"dlg_toggle_{pid}",
+    )
+    cur_val = int(st.session_state["part_limit_values"].get(pid, 500))
+    new_val = cur_val
+    if enable_cap:
+        new_val = st.number_input(
+            "Spending limit per order ($)",
+            min_value=0,
+            value=cur_val,
+            step=100,
+            key=f"dlg_val_{pid}",
+        )
+    else:
+        st.caption("No cap — eligible orders for this part will be placed automatically.")
+
+    c_save, c_cancel = st.columns(2)
+    with c_save:
+        if st.button("Save", type="primary", width="stretch", key=f"dlg_save_{pid}"):
+            selected = list(st.session_state["selected_limit_parts"])
+            if enable_cap:
+                if pid not in selected:
+                    selected.append(pid)
+                st.session_state["part_limit_values"][pid] = float(new_val)
+            else:
+                selected = [x for x in selected if x != pid]
+            st.session_state["selected_limit_parts"] = sorted(selected)
+            st.rerun()
+    with c_cancel:
+        if st.button("Cancel", width="stretch", key=f"dlg_cancel_{pid}"):
+            st.rerun()
+
+
 with tab_inv:
     if not db_ready:
         st.info("Press Reset demo")
@@ -682,31 +725,54 @@ with tab_inv:
     elif inventory is None:
         st.warning(f"backend not ready: rules ({inventory_error})")
     else:
-        head = (
-            "<thead><tr><th>Part</th><th class='num'>On hand</th><th class='num'>Reserved for jobs</th>"
-            "<th class='num'>On order</th><th class='num'>Available</th><th class='num'>Reorder at</th>"
-            "<th>Status</th></tr></thead>"
-        )
-        body = []
-        for p in inventory:
-            pill_class, pill_text = STATUS_PILLS.get(p["status"], ("", p["status"]))
-            lim_badge = (
-                f" · cap {money(active_part_limits[p['part_id']])}"
-                if p["part_id"] in active_part_limits
-                else ""
-            )
-            body.append(
-                f"<tr><td><b>{p['part_id']}</b> {p['name']}<span class='pb-why'>{available_line(p)}{lim_badge}</span></td>"
-                f"<td class='num'>{p['on_hand']}</td><td class='num'>{p['reserved']}</td>"
-                f"<td class='num'>{p['on_order']}</td><td class='num avail'>{p['available']}</td>"
-                f"<td class='num'>{p['reorder_point']}</td>"
-                f"<td><span class='pb-pill {pill_class}'>{pill_text}</span></td></tr>"
-            )
+        st.caption("Click any part name below to set or edit its spending limit. Available = on hand - reserved for jobs.")
         st.markdown(
-            f"<div class='pb-table-wrap'><table class='pb-table'>{head}<tbody>{''.join(body)}</tbody></table></div>",
+            "<div class='pb-inv-head'><div class='pb-inv-head-grid'>"
+            "<div>Part</div><div class='num'>On hand</div><div class='num'>Reserved</div>"
+            "<div class='num'>On order</div><div class='num'>Available</div>"
+            "<div class='num'>Reorder at</div><div>Status</div>"
+            "</div></div>",
             unsafe_allow_html=True,
         )
-        st.caption("Available = on hand - reserved for jobs (header locked while scrolling).")
+        col_widths = [3.8, 0.85, 0.95, 0.85, 0.95, 1.0, 1.4]
+        for idx, p in enumerate(inventory):
+            pid = p["part_id"]
+            pill_class, pill_text = STATUS_PILLS.get(p["status"], ("", p["status"]))
+            lim_badge = (
+                f"<span class='pb-cap-badge'>Cap {money(active_part_limits[pid])}</span>"
+                if pid in active_part_limits
+                else ""
+            )
+            r_cols = st.columns(col_widths, vertical_alignment="top")
+            with r_cols[0]:
+                if st.button(
+                    f"**{pid}** {p['name']}",
+                    key=f"inv_pick_{pid}",
+                    type="tertiary",
+                    help="Click to set or edit this part's spending limit",
+                ):
+                    edit_part_limit_dialog(pid)
+                st.markdown(
+                    f"<span class='pb-why'>{available_line(p)}{lim_badge}</span>",
+                    unsafe_allow_html=True,
+                )
+            with r_cols[1]:
+                st.markdown(f"<div class='pb-cell-num'>{p['on_hand']}</div>", unsafe_allow_html=True)
+            with r_cols[2]:
+                st.markdown(f"<div class='pb-cell-num'>{p['reserved']}</div>", unsafe_allow_html=True)
+            with r_cols[3]:
+                st.markdown(f"<div class='pb-cell-num'>{p['on_order']}</div>", unsafe_allow_html=True)
+            with r_cols[4]:
+                st.markdown(f"<div class='pb-cell-avail'>{p['available']}</div>", unsafe_allow_html=True)
+            with r_cols[5]:
+                st.markdown(f"<div class='pb-cell-num'>{p['reorder_point']}</div>", unsafe_allow_html=True)
+            with r_cols[6]:
+                st.markdown(
+                    f"<div class='pb-cell-status'><span class='pb-pill {pill_class}'>{pill_text}</span></div>",
+                    unsafe_allow_html=True,
+                )
+            if idx < len(inventory) - 1:
+                st.markdown("<hr class='pb-row-sep'/>", unsafe_allow_html=True)
 
 
 # Approvals
