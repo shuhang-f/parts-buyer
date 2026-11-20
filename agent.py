@@ -1,7 +1,8 @@
 """Parts Buyer agent: Plan A (tool-calling via OpenRouter or Google AI Studio) and Plan B (rules-first + explainer).
 
 All money and compliance rules live in rules.py. This module resolves the spending limit once per run
-via rules.get_spend_limit(spend_limit), tells the model that exact limit, and passes it to tools.py.
+via rules.get_spend_limit(spend_limit), tells the model that exact limit, passes it to tools.py,
+streams live progress events via an optional on_event callback, and verifies DB completion before finishing.
 """
 
 from __future__ import annotations
@@ -18,11 +19,12 @@ from openai import OpenAI
 import audit
 import db
 import rules
-from tools import TOOLS_SCHEMA, ToolSession
+from tools import TOOLS_SCHEMA, EventCallback, ToolSession
 
 ROOT = Path(__file__).resolve().parent
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o-mini"
 
 SYSTEM_PROMPT_TEMPLATE = """You are Parts Buyer, the purchasing agent for an equipment service shop.
 Today is {TODAY}. The owner's spending limit per order is ${SPEND_LIMIT}.
@@ -43,8 +45,17 @@ Your job on each run:
 
 Rules you cannot change: only approved suppliers, never order twice, and
 anything over the spending limit waits for the owner. If a tool refuses
-something, accept it and explain it. Never invent prices, stock or parts.
+something, accept it and explain it. Never invent prices, stock, PO numbers, or parts.
+NEVER claim an order was placed unless you actually called place_order and received its tool response.
 When every part is handled, reply with a short summary of the run."""
+
+
+def _emit(on_event: EventCallback | None, event: dict[str, Any]) -> None:
+    if on_event is not None:
+        try:
+            on_event(event)
+        except Exception:
+            pass
 
 
 def _get_llm_config(model_override: str | None = None) -> tuple[str, str, str, str]:
@@ -56,7 +67,7 @@ def _get_llm_config(model_override: str | None = None) -> tuple[str, str, str, s
     env_model = os.getenv("MODEL", "").strip()
 
     if provider_pref == "openrouter" or (openrouter_key and not gemini_key):
-        model = (model_override or env_model or "openrouter/auto").strip()
+        model = (model_override or env_model or DEFAULT_OPENROUTER_MODEL).strip()
         return "openrouter", openrouter_key, OPENROUTER_BASE_URL, model
 
     if gemini_key:
@@ -64,7 +75,7 @@ def _get_llm_config(model_override: str | None = None) -> tuple[str, str, str, s
         chosen = model_override or (env_model if env_model and "/" not in env_model else default_gemini)
         return "gemini", gemini_key, GEMINI_OPENAI_BASE_URL, chosen.strip()
 
-    return "none", "", OPENROUTER_BASE_URL, (model_override or env_model or "openrouter/auto")
+    return "none", "", OPENROUTER_BASE_URL, (model_override or env_model or DEFAULT_OPENROUTER_MODEL)
 
 
 def _make_client(provider: str, api_key: str, base_url: str) -> OpenAI:
@@ -83,6 +94,34 @@ def _format_limit(limit: float) -> str:
     return f"{int(round(limit)):,}" if float(limit).is_integer() else f"{limit:,.2f}"
 
 
+def _serialize_assistant_message(msg: Any) -> dict[str, Any]:
+    """Build a provider-safe assistant message preserving tool_calls and Gemini extra_content."""
+    raw = msg.model_dump(exclude_none=True) if hasattr(msg, "model_dump") else dict(msg)
+    out: dict[str, Any] = {
+        "role": "assistant",
+        "content": raw.get("content") if raw.get("content") is not None else "",
+    }
+    if raw.get("tool_calls"):
+        clean_calls: list[dict[str, Any]] = []
+        for tc in raw["tool_calls"]:
+            fn = tc.get("function") or {}
+            item: dict[str, Any] = {
+                "id": tc.get("id"),
+                "type": tc.get("type", "function"),
+                "function": {
+                    "name": fn.get("name"),
+                    "arguments": fn.get("arguments", "{}"),
+                },
+            }
+            if tc.get("extra_content") is not None:
+                item["extra_content"] = tc["extra_content"]
+            clean_calls.append(item)
+        out["tool_calls"] = clean_calls
+    if raw.get("extra_content") is not None:
+        out["extra_content"] = raw["extra_content"]
+    return out
+
+
 def _chat_with_resilience(
     client: OpenAI,
     *,
@@ -91,7 +130,7 @@ def _chat_with_resilience(
     fallback_model: str,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
-    timeout: int = 25,
+    timeout: int = 30,
 ) -> tuple[Any, str]:
     """Call chat completions with automatic 503/timeout fallback and polite 429 retry backoff."""
     model_now = active_model
@@ -143,11 +182,127 @@ def _summarize_run_from_db(run_id: str, limit: float) -> dict[str, Any]:
     }
 
 
+def _incomplete_parts(run_id: str, all_part_ids: list[str]) -> tuple[list[str], list[str]]:
+    """Return (missing_eval_parts, unfinished_gap_parts) according to the actual DB audit log."""
+    entries = audit.read_by_run(run_id)
+    evaluated = {
+        e["part_id"]
+        for e in entries
+        if e["part_id"] and e["step"] in ("checked", "skipped", "gap_found")
+    }
+    terminal = {
+        e["part_id"]
+        for e in entries
+        if e["part_id"]
+        and e["step"] in ("checked", "skipped", "order_placed", "approval_requested", "no_viable_offer")
+    }
+    missing = [pid for pid in all_part_ids if pid not in evaluated]
+    unfinished = [pid for pid in all_part_ids if pid in evaluated and pid not in terminal]
+    return missing, unfinished
+
+
+def _fallback_note(part_id: str, entries: list[dict[str, Any]]) -> str:
+    bits: list[str] = []
+    for step in ("gap_found", "rejected_option", "recheck", "order_placed", "approval_requested", "no_viable_offer"):
+        msgs = [e["message"] for e in entries if e["step"] == step]
+        if msgs:
+            bits.append(msgs[0] if step != "rejected_option" else " ".join(msgs[:2]))
+    return " ".join(bits) if bits else f"Handled {part_id} per purchasing policy."
+
+
+def _complete_remaining_parts(
+    session: ToolSession,
+    run_id: str,
+    missing_parts: list[str],
+    unfinished_parts: list[str],
+    on_event: EventCallback | None = None,
+) -> list[str]:
+    """Safety net: finish any parts the LLM skipped or left mid-flight, using ToolSession."""
+    recovered: list[str] = []
+    entries = audit.read_by_run(run_id)
+    recheck_passed: set[str] = {
+        e["data"].get("offer_id")
+        for e in entries
+        if e["step"] == "recheck" and e["data"].get("passed") and e["data"].get("offer_id")
+    }
+    recheck_failed: set[str] = {
+        e["data"].get("offer_id")
+        for e in entries
+        if e["step"] == "recheck" and not e["data"].get("passed") and e["data"].get("offer_id")
+    }
+
+    for pid in missing_parts + unfinished_parts:
+        recovered.append(pid)
+        if pid in missing_parts:
+            ev = session.evaluate_part(pid)
+        else:
+            ev = rules._evaluate(pid, spend_limit=session.spend_limit)
+            for o in ev.get("eligible_offers", []):
+                if o.get("offer_id"):
+                    session._offer_to_part[o["offer_id"]] = pid
+
+        if ev.get("existing_order") or not ev.get("needs_buying"):
+            continue
+
+        placed_or_pending = False
+        for offer in ev.get("eligible_offers", []):
+            oid = offer["offer_id"]
+            if oid in recheck_failed:
+                continue
+            if oid not in recheck_passed:
+                rc = session.recheck_offer(oid, ev["qty"])
+                if not rc.get("passed"):
+                    recheck_failed.add(oid)
+                    continue
+                recheck_passed.add(oid)
+            res = session.place_order(pid, oid, ev["qty"])
+            if res.get("status") in ("placed", "pending_approval", "exists"):
+                placed_or_pending = True
+                break
+
+        if not placed_or_pending and ev.get("eligible_offers"):
+            audit.log(
+                run_id,
+                pid,
+                "no_viable_offer",
+                "Every eligible offer failed the recheck. Nothing ordered; the owner should look at this part.",
+                {"qty": ev["qty"]},
+            )
+            _emit(
+                on_event,
+                {
+                    "type": "no_viable_offer",
+                    "part_id": pid,
+                    "reason": "Every eligible offer failed the live recheck.",
+                },
+            )
+
+    return recovered
+
+
+def _ensure_agent_notes(session: ToolSession, run_id: str) -> None:
+    """Ensure every placed/pending_approval part in this run has a plain-English agent_note."""
+    entries = audit.read_by_run(run_id)
+    acted = sorted(
+        {
+            e["part_id"]
+            for e in entries
+            if e["part_id"] and e["step"] in ("order_placed", "approval_requested")
+        }
+    )
+    noted = {e["part_id"] for e in entries if e["part_id"] and e["step"] == "agent_note"}
+    for pid in acted:
+        if pid not in noted:
+            part_entries = [e for e in entries if e["part_id"] == pid]
+            session.log_reasoning(pid, _fallback_note(pid, part_entries))
+
+
 def run_agent(
     spend_limit: float | None = None,
     *,
     model: str | None = None,
     max_turns: int = 40,
+    on_event: EventCallback | None = None,
 ) -> dict[str, Any]:
     """Plan A: tool-calling agent wrapping rules.py and audit.py (up to 40 turns)."""
     provider, api_key, base_url, model_name = _get_llm_config(model)
@@ -159,8 +314,23 @@ def run_agent(
     run_id = rules.start_run()
     limit = rules.get_spend_limit(spend_limit)  # once per run: model and code see identical limit
     today_str = db.today()
+    all_part_ids = [p["part_id"] for p in rules.get_inventory_status()]
 
-    session = ToolSession(run_id=run_id, spend_limit=limit)
+    _emit(
+        on_event,
+        {
+            "type": "run_started",
+            "run_id": run_id,
+            "mode": "agent",
+            "provider": provider,
+            "model": model_name,
+            "spend_limit": limit,
+            "today": today_str,
+            "part_ids": all_part_ids,
+        },
+    )
+
+    session = ToolSession(run_id=run_id, spend_limit=limit, on_event=on_event)
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         TODAY=today_str,
         SPEND_LIMIT=_format_limit(limit),
@@ -171,8 +341,9 @@ def run_agent(
             "role": "user",
             "content": (
                 f"Run today's ({today_str}) parts purchasing cycle across every part in part_id order "
-                "(P01 through P08). Recheck every winning offer before calling place_order, always call "
-                "place_order even when over the spending limit, and call log_reasoning for each part acted on."
+                f"({', '.join(all_part_ids)}). Recheck every winning offer before calling place_order, "
+                "always call place_order even when over the spending limit, and call log_reasoning for "
+                "each part acted on."
             ),
         },
     ]
@@ -184,9 +355,12 @@ def run_agent(
     prompt_tokens = 0
     completion_tokens = 0
     turns = 0
+    nudges = 0
     final_reply = ""
+    recovered_parts: list[str] = []
 
     for turns in range(1, max_turns + 1):
+        _emit(on_event, {"type": "thinking", "turn": turns, "model": active_model})
         response, active_model = _chat_with_resilience(
             client,
             provider=provider,
@@ -200,12 +374,39 @@ def run_agent(
             completion_tokens += int(response.usage.completion_tokens or 0)
 
         msg = response.choices[0].message
-        # Preserve provider fields (e.g., Gemini 3/4 thought_signature in extra_content)
-        assistant_msg: dict[str, Any] = msg.model_dump(exclude_none=True)
-        assistant_msg.setdefault("role", "assistant")
-        messages.append(assistant_msg)
+        messages.append(_serialize_assistant_message(msg))
 
         if not msg.tool_calls:
+            missing_parts, unfinished_parts = _incomplete_parts(run_id, all_part_ids)
+            if (missing_parts or unfinished_parts) and nudges < 3 and turns < max_turns:
+                nudges += 1
+                _emit(
+                    on_event,
+                    {
+                        "type": "nudge",
+                        "turn": turns,
+                        "missing_parts": missing_parts,
+                        "unfinished_parts": unfinished_parts,
+                    },
+                )
+                details: list[str] = []
+                if missing_parts:
+                    details.append(f"Not yet evaluated with evaluate_part: {', '.join(missing_parts)}.")
+                if unfinished_parts:
+                    details.append(
+                        f"Evaluated as short but no order/approval recorded yet (call recheck_offer then place_order): {', '.join(unfinished_parts)}."
+                    )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Do not stop yet—the database shows unfinished work. "
+                            + " ".join(details)
+                            + " Call the required tools right now; do not describe orders in text without calling place_order."
+                        ),
+                    }
+                )
+                continue
             final_reply = msg.content or ""
             break
 
@@ -226,6 +427,23 @@ def run_agent(
                 }
             )
 
+    # Safety net: if a weak/flaky model still left parts unprocessed after nudges, complete them cleanly.
+    missing_parts, unfinished_parts = _incomplete_parts(run_id, all_part_ids)
+    if missing_parts or unfinished_parts:
+        _emit(
+            on_event,
+            {
+                "type": "safety_net",
+                "missing_parts": missing_parts,
+                "unfinished_parts": unfinished_parts,
+            },
+        )
+        recovered_parts = _complete_remaining_parts(
+            session, run_id, missing_parts, unfinished_parts, on_event=on_event
+        )
+
+    _ensure_agent_notes(session, run_id)
+
     summary = _summarize_run_from_db(run_id, limit)
     summary.update(
         {
@@ -233,6 +451,8 @@ def run_agent(
             "provider": provider,
             "model": active_model,
             "turns": turns,
+            "nudges": nudges,
+            "recovered_parts": recovered_parts,
             "elapsed_seconds": round(time.perf_counter() - start_ts, 2),
             "usage": {
                 "prompt_tokens": prompt_tokens,
@@ -242,22 +462,15 @@ def run_agent(
             "final_reply": final_reply,
         }
     )
+    _emit(on_event, {"type": "run_finished", "summary": summary})
     return summary
-
-
-def _fallback_note(part_id: str, entries: list[dict[str, Any]]) -> str:
-    bits: list[str] = []
-    for step in ("gap_found", "rejected_option", "recheck", "order_placed", "approval_requested", "no_viable_offer"):
-        msgs = [e["message"] for e in entries if e["step"] == step]
-        if msgs:
-            bits.append(msgs[0] if step != "rejected_option" else " ".join(msgs[:2]))
-    return " ".join(bits) if bits else f"Handled {part_id} per purchasing policy."
 
 
 def run_explain_only(
     spend_limit: float | None = None,
     *,
     model: str | None = None,
+    on_event: EventCallback | None = None,
 ) -> dict[str, Any]:
     """Plan B: run rules_only first, then make one model call per gap part to explain in plain English."""
     limit = rules.get_spend_limit(spend_limit)
@@ -318,6 +531,7 @@ def run_explain_only(
 
         audit.log(run_id, part_id, "agent_note", text, {"source": "plan_b"})
         notes[part_id] = text
+        _emit(on_event, {"type": "reasoning_logged", "part_id": part_id, "text": text})
 
     summary.update(
         {
@@ -333,4 +547,5 @@ def run_explain_only(
             "agent_notes": notes,
         }
     )
+    _emit(on_event, {"type": "run_finished", "summary": summary})
     return summary
