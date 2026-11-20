@@ -4,6 +4,7 @@ Display only. All money and compliance logic lives in rules.py; this file
 reads the database, shows it, and calls the backend when a button is pressed.
 """
 
+import inspect
 import json
 import os
 import re
@@ -48,6 +49,11 @@ st.markdown(
     .pb-short { background: rgba(214,69,65,.16); color: #b3261e; }
     .pb-ordered { background: rgba(30,110,220,.16); color: #1a5fb4; }
     .pb-waiting { background: rgba(230,160,0,.22); color: #8a5a00; }
+    .pb-queued { background: rgba(128,128,128,.14); color: rgba(128,128,128,.95); }
+    .pb-checking { background: rgba(30,110,220,.18); color: #1a5fb4; outline: 2px solid rgba(30,110,220,.55); }
+    .pb-tracker { display: flex; flex-wrap: wrap; gap: 0.45rem; margin: 0.45rem 0 0.75rem; }
+    .pb-track-item { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.22rem 0.6rem; border-radius: 999px; font-size: 0.88rem; font-weight: 600; }
+    .pb-meta { font-size: 0.92rem; opacity: 0.75; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -199,6 +205,8 @@ with st.sidebar:
 if reset_clicked:
     st.session_state.pop("ran", None)
     st.session_state.pop("last_result", None)
+    st.session_state.pop("last_activity", None)
+    st.session_state.pop("last_part_states", None)
     if "db" in backend:
         try:
             backend["db"].reset_demo()
@@ -208,60 +216,12 @@ if reset_clicked:
     else:
         st.session_state["flash"] = ("warning", "backend not ready: db")
 
-if run_clicked:
-    module = "agent" if mode == "Agent" else "rules"
-    if not db_usable():
-        st.session_state["flash"] = ("warning", "Press Reset demo first. The demo data isn't loaded yet.")
-    elif module not in backend:
-        st.session_state["flash"] = ("warning", f"backend not ready: {module}")
-    else:
-        # The crash switch is read by the backend from CRASH_AFTER_ORDERS (SPEC section 7).
-        previous_crash = os.environ.get("CRASH_AFTER_ORDERS")
-        os.environ["CRASH_AFTER_ORDERS"] = "2" if crash_test else "0"
-        try:
-            with st.spinner("Checking parts and shopping suppliers..."):
-                if module == "agent":
-                    result = backend["agent"].run_agent(spend_limit=run_limit)
-                else:
-                    result = backend["rules"].run_rules_only(spend_limit=run_limit)
-            st.session_state["ran"] = True
-            st.session_state["last_result"] = result
-        except Exception as exc:
-            st.session_state.pop("ran", None)
-            if "simulated crash" in str(exc).lower():
-                st.session_state["flash"] = (
-                    "error",
-                    "Crash test: the run stopped on purpose. Everything saved so far is kept. "
-                    "Turn Crash test off and run again: nothing will be ordered twice.",
-                )
-            else:
-                st.session_state["flash"] = ("error", f"The run stopped with an error: {exc}")
-        finally:
-            if previous_crash is None:
-                os.environ.pop("CRASH_AFTER_ORDERS", None)
-            else:
-                os.environ["CRASH_AFTER_ORDERS"] = previous_crash
-
-# --- Data ------------------------------------------------------------------
-db_ready = db_usable()
-orders = read_table(
-    "SELECT po_id, idempotency_key, part_id, supplier_id, offer_id, qty, unit_price, "
-    "shipping, total, status, approved_by, created_at FROM purchase_orders"
-)
-audit = read_table(
-    "SELECT id, run_id, ts, part_id, step, message, data_json FROM audit_log ORDER BY ts, id"
-)
-names = read_table("SELECT part_id, name FROM parts")
+# --- Lookup helpers & live KPI/tracker renderers ---------------------------
+names = read_table("SELECT part_id, name FROM parts ORDER BY part_id")
 part_names = dict(zip(names["part_id"], names["name"])) if names is not None else {}
+all_part_ids = list(part_names.keys())
 sups = read_table("SELECT supplier_id, name FROM suppliers")
 supplier_names = dict(zip(sups["supplier_id"], sups["name"])) if sups is not None else {}
-
-inventory, inventory_error = None, None
-if db_ready and "rules" in backend:
-    try:
-        inventory = backend["rules"].get_inventory_status()
-    except Exception as exc:
-        inventory_error = exc
 
 
 def supplier_label(sid):
@@ -279,27 +239,326 @@ def row_data(row):
         return {}
 
 
-if orders is not None and not orders.empty:
-    placed = orders[orders["status"] == "placed"]
-    orders_placed = len(placed)
-    dollars = placed["total"].fillna(0).sum()
-    awaiting = int((orders["status"] == "pending_approval").sum())
-else:
-    orders_placed, dollars, awaiting = 0, 0, 0
+def compute_kpis(orders_df, audit_df, active_run_id=None):
+    if orders_df is not None and not orders_df.empty:
+        placed = orders_df[orders_df["status"] == "placed"]
+        n_placed = len(placed)
+        committed = float(placed["total"].fillna(0).sum())
+        n_awaiting = int((orders_df["status"] == "pending_approval").sum())
+    else:
+        n_placed, committed, n_awaiting = 0, 0.0, 0
 
-runs = audit[~audit["run_id"].astype(str).str.startswith("owner-")] if audit is not None else None
-if runs is not None and not runs.empty:
-    latest_run = runs["run_id"].iloc[-1]  # owner approvals are not runs
-    parts_checked = runs.loc[runs["run_id"] == latest_run, "part_id"].dropna().nunique()
-else:
-    parts_checked = 0
+    runs_df = (
+        audit_df[~audit_df["run_id"].astype(str).str.startswith("owner-")]
+        if audit_df is not None and not audit_df.empty
+        else None
+    )
+    if runs_df is not None and not runs_df.empty:
+        target_run = active_run_id or runs_df["run_id"].iloc[-1]
+        n_checked = int(runs_df.loc[runs_df["run_id"] == target_run, "part_id"].dropna().nunique())
+    else:
+        n_checked = 0
+    return n_checked, n_placed, committed, n_awaiting
 
-# --- Main area -------------------------------------------------------------
+
+def read_live_kpis(active_run_id=None):
+    o = read_table("SELECT total, status FROM purchase_orders")
+    a = read_table("SELECT run_id, part_id FROM audit_log ORDER BY ts, id")
+    return compute_kpis(o, a, active_run_id=active_run_id)
+
+
+def render_kpis(slot, n_checked, n_placed, committed, n_awaiting):
+    with slot.container():
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Parts checked", n_checked)
+        c2.metric("Orders placed", n_placed)
+        c3.metric("Dollars committed", money(committed))
+        c4.metric("Awaiting approval", n_awaiting)
+
+
+TRACK_STYLE = {
+    "queued": ("pb-queued", "Queued"),
+    "checking": ("pb-checking", "Checking…"),
+    "ok": ("pb-ok", "Stock OK"),
+    "ordered": ("pb-ordered", "Ordered"),
+    "waiting": ("pb-waiting", "Awaiting approval"),
+    "skipped": ("pb-queued", "Handled"),
+    "blocked": ("pb-short", "Blocked"),
+}
+
+
+def render_tracker(slot, part_states):
+    if not part_states:
+        slot.empty()
+        return
+    pills = []
+    for pid, state_key in part_states.items():
+        css, label = TRACK_STYLE.get(state_key, ("pb-queued", state_key))
+        pills.append(f"<span class='pb-track-item {css}'><b>{pid}</b> · {label}</span>")
+    slot.markdown(f"<div class='pb-tracker'>{''.join(pills)}</div>", unsafe_allow_html=True)
+
+
+# --- Top slots (updated live during a run) ---------------------------------
+flash_slot = st.empty()
+summary_slot = st.empty()
+kpi_slot = st.empty()
+
+init_checked, init_placed, init_dollars, init_awaiting = read_live_kpis()
+render_kpis(kpi_slot, init_checked, init_placed, init_dollars, init_awaiting)
+
+live_ran_this_pass = False
+if run_clicked:
+    module = "agent" if mode == "Agent" else "rules"
+    if not db_usable():
+        st.session_state["flash"] = ("warning", "Press Reset demo first. The demo data isn't loaded yet.")
+    elif module not in backend:
+        st.session_state["flash"] = ("warning", f"backend not ready: {module}")
+    else:
+        # The crash switch is read by the backend from CRASH_AFTER_ORDERS (SPEC section 7).
+        previous_crash = os.environ.get("CRASH_AFTER_ORDERS")
+        os.environ["CRASH_AFTER_ORDERS"] = "2" if crash_test else "0"
+        live_ran_this_pass = True
+        try:
+            if module == "agent":
+                part_states = {pid: "queued" for pid in all_part_ids}
+                total_parts = max(len(all_part_ids), 1)
+                done_parts = set()
+                activity_lines = []
+                active_run_ref = {"run_id": None}
+
+                progress_bar = st.progress(0.0, text="Starting Parts Buyer agent…")
+                tracker_slot = st.empty()
+                render_tracker(tracker_slot, part_states)
+                status_box = st.status("Running Parts Buyer agent…", expanded=True)
+
+                def add_log(line):
+                    activity_lines.append(line)
+                    status_box.markdown(line)
+
+                def refresh_live_ui(text=None):
+                    frac = min(len(done_parts) / total_parts, 1.0)
+                    label = text or f"{len(done_parts)} / {total_parts} parts checked"
+                    progress_bar.progress(frac, text=label)
+                    render_tracker(tracker_slot, part_states)
+                    render_kpis(kpi_slot, *read_live_kpis(active_run_ref["run_id"]))
+
+                def on_event(ev):
+                    etype = ev.get("type")
+                    pid = ev.get("part_id")
+                    if etype == "run_started":
+                        active_run_ref["run_id"] = ev.get("run_id")
+                        for p in ev.get("part_ids") or []:
+                            part_states.setdefault(p, "queued")
+                        model_txt = ev.get("model") or "model"
+                        add_log(
+                            f"🚀 **Started run** (`{model_txt}`) · spending limit **{money(ev.get('spend_limit', 1000))}**"
+                        )
+                        refresh_live_ui(f"0 / {total_parts} parts checked · Connected to {model_txt}")
+
+                    elif etype == "thinking":
+                        turn = ev.get("turn", 1)
+                        model_txt = ev.get("model") or "model"
+                        progress_bar.progress(
+                            min(len(done_parts) / total_parts, 0.99),
+                            text=f"{len(done_parts)} / {total_parts} parts checked · Thinking (step {turn}, {model_txt})…",
+                        )
+
+                    elif etype == "inventory_checked":
+                        tot = ev.get("total_parts", total_parts)
+                        short = ev.get("short_count", 0)
+                        add_log(f"📋 **Checked inventory** — {tot} parts total ({short} short, {tot - short} OK)")
+
+                    elif etype == "part_start" and pid:
+                        part_states[pid] = "checking"
+                        refresh_live_ui(f"{len(done_parts)} / {total_parts} parts checked · Inspecting {part_label(pid)}…")
+
+                    elif etype == "part_evaluated" and pid:
+                        if ev.get("existing_order"):
+                            po = ev["existing_order"]
+                            part_states[pid] = "skipped"
+                            done_parts.add(pid)
+                            add_log(f"⏭️ **{part_label(pid)}** — Already handled today ({po.get('po_id')})")
+                        elif not ev.get("needs_buying"):
+                            part_states[pid] = "ok"
+                            done_parts.add(pid)
+                            add_log(
+                                f"✅ **{part_label(pid)}** — Stock OK "
+                                f"({ev.get('available')} available, reorder at {ev.get('reorder_point')})"
+                            )
+                        else:
+                            part_states[pid] = "checking"
+                            bits = [
+                                f"🔎 **{part_label(pid)}** — Short "
+                                f"({ev.get('available')} available < {ev.get('reorder_point')}), buying **{ev.get('qty')}**"
+                            ]
+                            rejected = ev.get("rejected") or []
+                            if rejected:
+                                rej_txt = "; ".join(
+                                    f"Ruled out {r.get('supplier_name') or supplier_label(r.get('supplier_id'))}"
+                                    for r in rejected[:2]
+                                )
+                                bits.append(rej_txt)
+                            eligible = ev.get("eligible_offers") or []
+                            if eligible:
+                                best = eligible[0]
+                                bits.append(
+                                    f"Best eligible: **{best.get('supplier_name') or supplier_label(best.get('supplier_id'))}** "
+                                    f"({money(best.get('landed'))})"
+                                )
+                            else:
+                                part_states[pid] = "blocked"
+                                done_parts.add(pid)
+                                bits.append("No eligible supplier found")
+                            add_log(" · ".join(bits))
+                        refresh_live_ui()
+
+                    elif etype == "offer_rechecked":
+                        sup = supplier_label(ev.get("supplier_id"))
+                        tag = f"**{pid}**" if pid else f"**{ev.get('offer_id')}**"
+                        if ev.get("passed"):
+                            add_log(
+                                f"🔎 {tag} — Live check passed for **{sup}** "
+                                f"({ev.get('live_stock')} in stock at {money(ev.get('live_price'))})"
+                            )
+                        else:
+                            add_log(
+                                f"⚠️ {tag} — Live check failed for **{sup}** "
+                                f"({plain_english(ev.get('reason'))}) → trying next supplier"
+                            )
+
+                    elif etype == "order_result" and pid:
+                        st_val = ev.get("status")
+                        sup = supplier_label(ev.get("supplier_id"))
+                        po_id = ev.get("po_id")
+                        tot = ev.get("total")
+                        lim = ev.get("spend_limit")
+                        if st_val == "placed":
+                            part_states[pid] = "ordered"
+                            done_parts.add(pid)
+                            add_log(
+                                f"🛒 **{part_label(pid)}** — Placed **{po_id}** with **{sup}** "
+                                f"({money(tot)}, within {money(lim)} limit)"
+                            )
+                        elif st_val == "pending_approval":
+                            part_states[pid] = "waiting"
+                            done_parts.add(pid)
+                            add_log(
+                                f"⏸️ **{part_label(pid)}** — Over {money(lim)} limit ({money(tot)}) "
+                                f"→ Held **{po_id}** with **{sup}** for owner approval"
+                            )
+                        elif st_val == "exists":
+                            part_states[pid] = "skipped"
+                            done_parts.add(pid)
+                            add_log(f"⏭️ **{part_label(pid)}** — {plain_english(ev.get('reason'))}")
+                        else:
+                            part_states[pid] = "blocked"
+                            done_parts.add(pid)
+                            add_log(f"🛑 **{part_label(pid)}** — Order blocked: {plain_english(ev.get('reason'))}")
+                        refresh_live_ui()
+
+                    elif etype == "reasoning_logged" and pid:
+                        add_log(f"💬 **{pid}** — Saved plain-English explanation")
+
+                    elif etype == "nudge":
+                        rem = ", ".join((ev.get("missing_parts") or []) + (ev.get("unfinished_parts") or []))
+                        add_log(f"🔁 Finishing remaining parts: **{rem}**")
+
+                    elif etype == "safety_net":
+                        rem = ", ".join((ev.get("missing_parts") or []) + (ev.get("unfinished_parts") or []))
+                        add_log(f"🛡️ Completing remaining parts via rules engine: **{rem}**")
+
+                    elif etype == "run_finished":
+                        summ = ev.get("summary") or {}
+                        elapsed = summ.get("elapsed_seconds", 0)
+                        n_c, n_p, d_c, n_a = read_live_kpis(active_run_ref["run_id"])
+                        render_kpis(kpi_slot, n_c, n_p, d_c, n_a)
+                        progress_bar.progress(
+                            1.0,
+                            text=f"Done in {elapsed}s — {len(done_parts)} / {total_parts} parts checked",
+                        )
+                        render_tracker(tracker_slot, part_states)
+                        status_box.update(
+                            label=(
+                                f"Agent run finished in {elapsed}s — "
+                                f"{plural(n_p, 'order', 'orders')} placed ({money(d_c)}), "
+                                f"{plural(n_a, 'order', 'orders')} awaiting approval"
+                            ),
+                            state="complete",
+                            expanded=False,
+                        )
+
+                sig = inspect.signature(backend["agent"].run_agent)
+                if "on_event" in sig.parameters:
+                    result = backend["agent"].run_agent(spend_limit=run_limit, on_event=on_event)
+                else:
+                    result = backend["agent"].run_agent(spend_limit=run_limit)
+                st.session_state["last_activity"] = activity_lines
+                st.session_state["last_part_states"] = part_states
+            else:
+                status_box = None
+                with st.status("Running rules engine…", expanded=False) as status_box:
+                    result = backend["rules"].run_rules_only(spend_limit=run_limit)
+                    status_box.update(label="Rules run finished.", state="complete", expanded=False)
+                st.session_state.pop("last_activity", None)
+                st.session_state.pop("last_part_states", None)
+            st.session_state["ran"] = True
+            st.session_state["last_result"] = result
+        except Exception as exc:
+            st.session_state.pop("ran", None)
+            if module == "agent":
+                st.session_state["last_activity"] = activity_lines
+                st.session_state["last_part_states"] = part_states
+            if "simulated crash" in str(exc).lower():
+                if module == "agent":
+                    status_box.markdown("💥 **Crash test triggered** — stopped on purpose after 2 orders. Everything saved so far is kept.")
+                    status_box.update(label="Crash test: stopped on purpose after 2 orders", state="error", expanded=True)
+                st.session_state["flash"] = (
+                    "error",
+                    "Crash test: the run stopped on purpose. Everything saved so far is kept. "
+                    "Turn Crash test off and run again: nothing will be ordered twice.",
+                )
+            else:
+                if module == "agent":
+                    status_box.markdown(f"❌ **Run error:** {exc}")
+                    status_box.update(label=f"Run stopped with an error", state="error", expanded=True)
+                st.session_state["flash"] = ("error", f"The run stopped with an error: {exc}")
+        finally:
+            if previous_crash is None:
+                os.environ.pop("CRASH_AFTER_ORDERS", None)
+            else:
+                os.environ["CRASH_AFTER_ORDERS"] = previous_crash
+
+# --- Data (fresh after any run/reset) --------------------------------------
+db_ready = db_usable()
+orders = read_table(
+    "SELECT po_id, idempotency_key, part_id, supplier_id, offer_id, qty, unit_price, "
+    "shipping, total, status, approved_by, created_at FROM purchase_orders"
+)
+audit = read_table(
+    "SELECT id, run_id, ts, part_id, step, message, data_json FROM audit_log ORDER BY ts, id"
+)
+names = read_table("SELECT part_id, name FROM parts ORDER BY part_id")
+part_names = dict(zip(names["part_id"], names["name"])) if names is not None else {}
+sups = read_table("SELECT supplier_id, name FROM suppliers")
+supplier_names = dict(zip(sups["supplier_id"], sups["name"])) if sups is not None else {}
+
+inventory, inventory_error = None, None
+if db_ready and "rules" in backend:
+    try:
+        inventory = backend["rules"].get_inventory_status()
+    except Exception as exc:
+        inventory_error = exc
+
+parts_checked, orders_placed, dollars, awaiting = compute_kpis(orders, audit)
+render_kpis(kpi_slot, parts_checked, orders_placed, dollars, awaiting)
+
+# --- Top messages & summary ------------------------------------------------
 flash = st.session_state.pop("flash", None)
 if flash:
-    getattr(st, flash[0])(flash[1])
-if not db_ready:
-    st.info("Press Reset demo")
+    with flash_slot.container():
+        getattr(st, flash[0])(flash[1])
+elif not db_ready:
+    flash_slot.info("Press Reset demo")
 
 # One-line run summary: "3 orders placed ($1,321), 1 needs your approval, 4 parts OK."
 if st.session_state.get("ran") and db_ready:
@@ -308,17 +567,11 @@ if st.session_state.get("ran") and db_ready:
         approval_text = "nothing needs your approval"
     else:
         approval_text = f"{awaiting} {'needs' if awaiting == 1 else 'need'} your approval"
-    st.markdown(
+    summary_slot.markdown(
         f'<div class="pb-summary">✅ {plural(orders_placed, "order", "orders")} placed '
         f"({money(dollars)}), {approval_text}, {plural(ok_parts, 'part', 'parts')} OK.</div>",
         unsafe_allow_html=True,
     )
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Parts checked", parts_checked)
-c2.metric("Orders placed", orders_placed)
-c3.metric("Dollars committed", money(dollars))
-c4.metric("Awaiting approval", awaiting)
 
 waiting_tab = f"Approvals ({awaiting})" if awaiting else "Approvals"
 tab_inv, tab_appr, tab_orders, tab_audit = st.tabs(["Inventory", waiting_tab, "Orders", "Audit trail"])
@@ -517,9 +770,57 @@ with tab_audit:
                         st.json(row_data(row), expanded=False)
 
 if st.session_state.get("last_result"):
-    with st.expander("Technical details of the last run"):
-        result = st.session_state["last_result"]
+    result = st.session_state["last_result"]
+    if isinstance(result, dict):
+        with st.container(border=True):
+            st.markdown("#### Last run summary")
+            placed_ids = result.get("placed") or []
+            pending_ids = result.get("pending_approval") or []
+            ok_ids = result.get("checked") or []
+            skipped_ids = result.get("skipped") or []
+            bullets = []
+            if placed_ids:
+                bullets.append(
+                    f"- **Ordered automatically ({len(placed_ids)}):** "
+                    + ", ".join(part_label(p) for p in placed_ids)
+                )
+            if pending_ids:
+                bullets.append(
+                    f"- **Waiting for your approval ({len(pending_ids)}):** "
+                    + ", ".join(part_label(p) for p in pending_ids)
+                )
+            if ok_ids:
+                bullets.append(
+                    f"- **Stock OK ({len(ok_ids)}):** "
+                    + ", ".join(part_label(p) for p in ok_ids)
+                )
+            if skipped_ids:
+                bullets.append(
+                    f"- **Already handled today ({len(skipped_ids)}):** "
+                    + ", ".join(part_label(p) for p in skipped_ids)
+                )
+            if bullets:
+                st.markdown("\n".join(bullets))
+            meta_bits = []
+            mode_label = "Agent" if result.get("mode") == "agent" else "Rules only"
+            meta_bits.append(f"Mode: {mode_label}")
+            if result.get("model"):
+                meta_bits.append(f"Model: `{result['model']}`")
+            if result.get("elapsed_seconds") is not None:
+                meta_bits.append(f"Time: {result['elapsed_seconds']}s")
+            if result.get("spend_limit") is not None:
+                meta_bits.append(f"Spending limit: {money(result['spend_limit'])}")
+            st.markdown(f"<span class='pb-meta'>{' · '.join(meta_bits)}</span>", unsafe_allow_html=True)
+
+    saved_activity = st.session_state.get("last_activity")
+    if saved_activity and not live_ran_this_pass:
+        with st.expander(f"Step-by-step activity log ({len(saved_activity)} events)", expanded=False):
+            for line in saved_activity:
+                st.markdown(line)
+
+    with st.expander("Technical details of the last run", expanded=False):
         if isinstance(result, (dict, list)):
             st.json(result)
         else:
             st.write(result)
+
