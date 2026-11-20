@@ -27,24 +27,25 @@ GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/opena
 DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o-mini"
 
 SYSTEM_PROMPT_TEMPLATE = """You are Parts Buyer, the purchasing agent for an equipment service shop.
-Today is {TODAY}. The owner's spending limit per order is ${SPEND_LIMIT}.
+Today is {TODAY}. {LIMIT_RULE}
 
 Your job on each run:
 1. Call get_inventory_status.
 2. Process every part in part_id order (P01, P02, P03, P04, P05, P06, P07, P08).
    For every part, call evaluate_part, even if it looks fine.
 3. If evaluate_part says the part needs buying and has eligible_offers, take the lowest landed-cost
-   eligible offer and call recheck_offer. If the recheck fails (passed=false), try the next eligible offer.
+   eligible offer and call recheck_offer using that offer's qty (which already includes any minimum
+   order batch / bulk discount). If the recheck fails (passed=false), try the next eligible offer.
    Never skip the recheck.
-4. ALWAYS call place_order for the offer that passed the recheck — EVEN IF landed cost exceeds
-   the ${SPEND_LIMIT} spending limit. The place_order tool enforces the limit in code and creates
+4. ALWAYS call place_order for the offer that passed the recheck using that offer's qty — EVEN IF
+   landed cost exceeds a part's spending limit. The place_order tool enforces limits in code and creates
    the pending_approval request for the owner; never skip calling place_order for over-limit items.
 5. For every part you acted on (placed or pending_approval), call log_reasoning with two or three
-   plain sentences: what triggered the purchase, which offer won and why, and what you rejected
-   and why. Write for a shop owner, not an engineer.
+   plain sentences: what triggered the purchase, which offer won and why (mention any minimum batch
+   or bulk discount if used), and what you rejected and why. Write for a shop owner, not an engineer.
 
 Rules you cannot change: only approved suppliers, never order twice, and
-anything over the spending limit waits for the owner. If a tool refuses
+anything over a part's spending limit waits for the owner. If a tool refuses
 something, accept it and explain it. Never invent prices, stock, PO numbers, or parts.
 NEVER claim an order was placed unless you actually called place_order and received its tool response.
 When every part is handled, reply with a short summary of the run."""
@@ -236,7 +237,7 @@ def _complete_remaining_parts(
         if pid in missing_parts:
             ev = session.evaluate_part(pid)
         else:
-            ev = rules._evaluate(pid, spend_limit=session.spend_limit)
+            ev = rules._evaluate(pid, spend_limit=session.spend_limit, part_limits=session.part_limits)
             for o in ev.get("eligible_offers", []):
                 if o.get("offer_id"):
                     session._offer_to_part[o["offer_id"]] = pid
@@ -247,15 +248,16 @@ def _complete_remaining_parts(
         placed_or_pending = False
         for offer in ev.get("eligible_offers", []):
             oid = offer["offer_id"]
+            order_qty = int(offer.get("qty", ev["qty"]))
             if oid in recheck_failed:
                 continue
             if oid not in recheck_passed:
-                rc = session.recheck_offer(oid, ev["qty"])
+                rc = session.recheck_offer(oid, order_qty)
                 if not rc.get("passed"):
                     recheck_failed.add(oid)
                     continue
                 recheck_passed.add(oid)
-            res = session.place_order(pid, oid, ev["qty"])
+            res = session.place_order(pid, oid, order_qty)
             if res.get("status") in ("placed", "pending_approval", "exists"):
                 placed_or_pending = True
                 break
@@ -297,12 +299,25 @@ def _ensure_agent_notes(session: ToolSession, run_id: str) -> None:
             session.log_reasoning(pid, _fallback_note(pid, part_entries))
 
 
+def _limit_rule_text(limit: float | None, part_limits: dict[str, float] | None) -> str:
+    if part_limits is not None:
+        if not part_limits:
+            return "There is no global spending limit and no part-specific spending limits are set."
+        pairs = ", ".join(f"{pid}: ${_format_limit(float(val))}" for pid, val in sorted(part_limits.items()))
+        return (
+            f"There is no global spending limit. Part-specific spending limits apply only to: {pairs}. "
+            "All other parts have no spending cap."
+        )
+    return f"The owner's spending limit per order is ${_format_limit(float(limit or 0))}."
+
+
 def run_agent(
     spend_limit: float | None = None,
     *,
     model: str | None = None,
     max_turns: int = 40,
     on_event: EventCallback | None = None,
+    part_limits: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Plan A: tool-calling agent wrapping rules.py and audit.py (up to 40 turns)."""
     provider, api_key, base_url, model_name = _get_llm_config(model)
@@ -312,7 +327,7 @@ def run_agent(
         )
 
     run_id = rules.start_run()
-    limit = rules.get_spend_limit(spend_limit)  # once per run: model and code see identical limit
+    limit = None if part_limits is not None else rules.get_spend_limit(spend_limit)
     today_str = db.today()
     all_part_ids = [p["part_id"] for p in rules.get_inventory_status()]
 
@@ -325,15 +340,21 @@ def run_agent(
             "provider": provider,
             "model": model_name,
             "spend_limit": limit,
+            "part_limits": part_limits,
             "today": today_str,
             "part_ids": all_part_ids,
         },
     )
 
-    session = ToolSession(run_id=run_id, spend_limit=limit, on_event=on_event)
+    session = ToolSession(
+        run_id=run_id,
+        spend_limit=limit,
+        part_limits=part_limits,
+        on_event=on_event,
+    )
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         TODAY=today_str,
-        SPEND_LIMIT=_format_limit(limit),
+        LIMIT_RULE=_limit_rule_text(limit, part_limits),
     )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -341,9 +362,9 @@ def run_agent(
             "role": "user",
             "content": (
                 f"Run today's ({today_str}) parts purchasing cycle across every part in part_id order "
-                f"({', '.join(all_part_ids)}). Recheck every winning offer before calling place_order, "
-                "always call place_order even when over the spending limit, and call log_reasoning for "
-                "each part acted on."
+                f"({', '.join(all_part_ids)}). Recheck every winning offer using that offer's qty "
+                "before calling place_order, always call place_order even when over a part's spending "
+                "limit, and call log_reasoning for each part acted on."
             ),
         },
     ]
@@ -450,6 +471,7 @@ def run_agent(
             "mode": "agent",
             "provider": provider,
             "model": active_model,
+            "part_limits": part_limits,
             "turns": turns,
             "nudges": nudges,
             "recovered_parts": recovered_parts,
@@ -471,11 +493,12 @@ def run_explain_only(
     *,
     model: str | None = None,
     on_event: EventCallback | None = None,
+    part_limits: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Plan B: run rules_only first, then make one model call per gap part to explain in plain English."""
-    limit = rules.get_spend_limit(spend_limit)
+    limit = None if part_limits is not None else rules.get_spend_limit(spend_limit)
     start_ts = time.perf_counter()
-    summary = rules.run_rules_only(spend_limit=limit)
+    summary = rules.run_rules_only(spend_limit=limit, part_limits=part_limits)
     run_id = summary["run_id"]
 
     provider, api_key, base_url, model_name = _get_llm_config(model)

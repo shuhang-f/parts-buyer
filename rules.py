@@ -82,13 +82,31 @@ def _supplier_name(name):
 
 
 # ------------------------------------------------------------------- reads --
+def _limit_for_part(part_id, spend_limit=None, part_limits=None):
+    """Resolve the spending limit for one part.
+
+    When part_limits is provided (dict of {part_id: dollar_limit}), ONLY parts
+    present in part_limits have a cap; all other parts return None (no limit).
+    When part_limits is None, falls back to get_spend_limit(spend_limit).
+    """
+    if part_limits is not None:
+        raw = part_limits.get(part_id)
+        if raw is None:
+            return None
+        limit = _valid_limit(raw)
+        if limit is None:
+            raise ValueError(f"Spending limit for {part_id} must be a number of 0 or more (got {raw!r})")
+        return limit
+    return get_spend_limit(spend_limit)
+
+
 def _part(conn, part_id):
     row = conn.execute("SELECT * FROM parts WHERE part_id = ?", (part_id,)).fetchone()
     if row is None:
         raise ValueError(f"Unknown part {part_id}")
     p = dict(row)
     p["approved"] = [s for s in p["approved_suppliers"].split(";") if s]
-    p["available"] = p["on_hand"] - p["reserved"] + p["on_order"]
+    p["available"] = p["on_hand"] - p["reserved"]
     return p
 
 
@@ -143,7 +161,7 @@ def get_inventory_status():
 
 
 # ---------------------------------------------------------------- evaluate --
-def _evaluate(part_id, spend_limit=None):
+def _evaluate(part_id, spend_limit=None, part_limits=None):
     """R1 to R4 for one part. No side effects. Used by evaluate_part (which logs)
     and by place_order (which re-validates)."""
     conn = db.connect()
@@ -153,7 +171,7 @@ def _evaluate(part_id, spend_limit=None):
         existing = _order_for_key(conn, idempotency_key(part_id))
     finally:
         conn.close()
-    limit = get_spend_limit(spend_limit)
+    limit = _limit_for_part(part_id, spend_limit=spend_limit, part_limits=part_limits)
 
     ev = {
         "part_id": part_id,
@@ -203,25 +221,35 @@ def _evaluate(part_id, spend_limit=None):
                 }
             )
             continue
-        if o["listed_stock"] < qty:
+        moq = max(1, int(o.get("min_order_qty") or 1))
+        order_qty = max(qty, moq)                                           # minimum order batch
+        if o["listed_stock"] < order_qty:
+            batch_note = f" (minimum batch {moq})" if moq > qty else ""
             ev["rejected"].append(
                 {**base, "rule": "stock",
-                 "reason": f"{name} lists only {o['listed_stock']} in stock, need {qty}"}
+                 "reason": f"{name} lists only {o['listed_stock']} in stock, need {order_qty}{batch_note}"}
             )
             continue
-        landed = o["unit_price"] * qty + o["shipping_flat"]                 # R4 landed cost
+        bulk_price = o.get("bulk_unit_price")
+        bulk_applied = bulk_price is not None and moq > 1 and order_qty >= moq
+        eff_unit_price = float(bulk_price) if bulk_applied else float(o["unit_price"])
+        landed = eff_unit_price * order_qty + o["shipping_flat"]            # R4 landed cost
         ev["eligible_offers"].append(
             {
                 **base,
                 "country": o["country"],
-                "unit_price": o["unit_price"],
+                "unit_price": eff_unit_price,
+                "regular_unit_price": float(o["unit_price"]),
+                "bulk_unit_price": float(bulk_price) if bulk_price is not None else None,
+                "min_order_qty": moq,
+                "bulk_applied": bulk_applied,
                 "shipping": o["shipping_flat"],
                 "listed_stock": o["listed_stock"],
                 "lead_time_days": o["lead_time_days"],
                 "arrival": arrival.isoformat(),
-                "qty": qty,
+                "qty": order_qty,
                 "landed": landed,
-                "needs_owner_approval": landed > limit,                     # R6 preview
+                "needs_owner_approval": (limit is not None and landed > limit),  # R6 preview
             }
         )
     ev["eligible_offers"].sort(key=lambda x: (x["landed"], x["offer_id"]))
@@ -235,16 +263,16 @@ SKIP_MESSAGES = {
 }
 
 
-def evaluate_part(part_id, run_id, spend_limit=None):
+def evaluate_part(part_id, run_id, spend_limit=None, part_limits=None):
     """R1 to R4 for one part, with audit rows.
 
     Logs skipped (order exists, R7), checked (no need, R1), or gap_found plus
     shopping and one rejected_option per ruled-out offer; no_viable_offer if
     nothing is eligible. Returns qty, deadline, eligible_offers ranked by
-    landed cost (offer_id, supplier_id, landed, ...), rejected (offer_id,
-    supplier_id, reason), plus the inventory numbers.
+    landed cost (offer_id, supplier_id, landed, qty, min_order_qty, ...),
+    rejected (offer_id, supplier_id, reason), plus the inventory numbers.
     """
-    ev = _evaluate(part_id, spend_limit)
+    ev = _evaluate(part_id, spend_limit, part_limits=part_limits)
 
     if ev["existing_order"]:                                                  # R7
         o = ev["existing_order"]
@@ -359,18 +387,18 @@ def _refuse(run_id, part_id, reason, data):
     return {"status": "refused", "po_id": None, "reason": reason}
 
 
-def place_order(part_id, offer_id, qty, run_id, spend_limit=None):
+def place_order(part_id, offer_id, qty, run_id, spend_limit=None, part_limits=None):
     """R3 to R7 enforced in code before anything is written.
 
     Returns {"status": "placed" | "pending_approval" | "refused" | "exists",
              "po_id", "reason", ...}.
     Refuses unless the offer is eligible for this part now (R3, R4, stock),
-    qty is the quantity the rules call for (R2), and a passing recheck of this
-    same offer exists in this run's audit log (R5). Logs chosen, then
-    order_placed or approval_requested.
+    qty matches the required order quantity (max of R2 needed qty and offer
+    minimum batch), and a passing recheck of this same offer exists in this
+    run's audit log (R5). Logs chosen, then order_placed or approval_requested.
     """
     data = {"offer_id": offer_id, "qty": qty}
-    ev = _evaluate(part_id, spend_limit)
+    ev = _evaluate(part_id, spend_limit, part_limits=part_limits)
     limit = ev["spend_limit"]
     key = idempotency_key(part_id)
 
@@ -386,16 +414,21 @@ def place_order(part_id, offer_id, qty, run_id, spend_limit=None):
                    f"offer {offer_id} is not an offer for {part_id}")
         return _refuse(run_id, part_id, f"offer not eligible: {why}", data)
     data["supplier_id"] = offer["supplier_id"]
-    if qty != ev["qty"]:
-        return _refuse(run_id, part_id, f"quantity must be {ev['qty']} (asked for {qty})", data)
+    expected_qty = int(offer["qty"])
+    if qty != expected_qty:
+        batch_hint = f" (minimum batch {offer['min_order_qty']})" if offer["min_order_qty"] > ev["qty"] else ""
+        return _refuse(run_id, part_id, f"quantity must be {expected_qty}{batch_hint} (asked for {qty})", data)
     if not _passing_recheck_in_run(run_id, offer_id, qty):                    # R5
         return _refuse(run_id, part_id, f"no passing recheck of {offer['supplier_name']} in this run", data)
 
     live = suppliers.recheck_offer(offer_id)
-    unit_price = float(live["unit_price"])
+    if offer.get("bulk_applied") and float(live["unit_price"]) == float(offer["regular_unit_price"]):
+        unit_price = float(offer["unit_price"])
+    else:
+        unit_price = float(live["unit_price"])
     shipping = float(offer["shipping"])
     total = unit_price * qty + shipping
-    status = "placed" if total <= limit else "pending_approval"              # R6
+    status = "placed" if (limit is None or total <= limit) else "pending_approval"  # R6
     cheaper = [o for o in ev["eligible_offers"] if o["landed"] < offer["landed"]]
     pricier = [o for o in ev["eligible_offers"] if o["landed"] >= offer["landed"] and o["offer_id"] != offer_id]
     why = "".join(
@@ -406,6 +439,11 @@ def place_order(part_id, offer_id, qty, run_id, spend_limit=None):
     )
     if pricier:
         why += f" Next best: {pricier[0]['supplier_name']} at {_money(pricier[0]['landed'])}."
+    bulk_note = (
+        f" (bulk batch MOQ {offer['min_order_qty']}, discounted from {_money(offer['regular_unit_price'])})"
+        if offer.get("bulk_applied")
+        else (f" (minimum batch {offer['min_order_qty']})" if offer.get("min_order_qty", 1) > 1 else "")
+    )
 
     conn = db.connect()
     try:
@@ -418,7 +456,9 @@ def place_order(part_id, offer_id, qty, run_id, spend_limit=None):
         po_id = _next_po_id(conn)
         row_data = {"po_id": po_id, "idempotency_key": key, "supplier_id": offer["supplier_id"],
                     "offer_id": offer_id, "qty": qty, "unit_price": unit_price, "shipping": shipping,
-                    "total": total, "spend_limit": limit, "arrival": offer["arrival"]}
+                    "total": total, "spend_limit": limit, "arrival": offer["arrival"],
+                    "min_order_qty": offer.get("min_order_qty", 1),
+                    "bulk_applied": bool(offer.get("bulk_applied"))}
         try:
             conn.execute(
                 "INSERT INTO purchase_orders (po_id, idempotency_key, part_id, supplier_id, offer_id, "
@@ -436,24 +476,31 @@ def place_order(part_id, offer_id, qty, run_id, spend_limit=None):
                     "reason": SKIP_MESSAGES[o["status"]].format(po_id=o["po_id"])}
 
         audit.log(run_id, part_id, "chosen",
-                  f"Chose {offer['supplier_name']}: {qty} x {_money(unit_price)} + "
+                  f"Chose {offer['supplier_name']}{bulk_note}: {qty} x {_money(unit_price)} + "
                   f"{_money(shipping)} shipping = {_money(total)}, the lowest landed cost that arrives in time"
                   f"{' and passed the recheck' if cheaper else ''}.{why}",
                   {**row_data, "rule": "R4"}, conn=conn)
         if status == "placed":
             conn.execute("UPDATE parts SET on_order = on_order + ? WHERE part_id = ?", (qty, part_id))
-            msg = (f"Placed {po_id} with {offer['supplier_name']}: {_money(total)}, within the "
-                   f"{_money(limit)} limit. {qty} added to on order.")
+            limit_clause = (
+                f"within the {_money(limit)} limit"
+                if limit is not None
+                else "no spending limit on this part"
+            )
+            msg = (f"Placed {po_id} with {offer['supplier_name']}: {_money(total)}, {limit_clause}. "
+                   f"{qty} added to on order.")
             audit.log(run_id, part_id, "order_placed", msg, {**row_data, "rule": "R6, R7"}, conn=conn)
         else:
-            msg = (f"{_money(total)} is over the {_money(limit)} spending limit. {po_id} with "
+            msg = (f"{_money(total)} is over the {_money(limit)} spending limit for {part_id}. {po_id} with "
                    f"{offer['supplier_name']} is waiting for the owner's approval.")
             audit.log(run_id, part_id, "approval_requested", msg, {**row_data, "rule": "R6"}, conn=conn)
         conn.commit()
     finally:
         conn.close()
     return {"status": status, "po_id": po_id, "reason": msg, "total": total,
-            "spend_limit": limit, "supplier_id": offer["supplier_id"]}
+            "spend_limit": limit, "supplier_id": offer["supplier_id"],
+            "min_order_qty": offer.get("min_order_qty", 1),
+            "bulk_applied": bool(offer.get("bulk_applied"))}
 
 
 def _decide(po_id, new_status, approver):
@@ -499,15 +546,15 @@ def reject_order(po_id, approver="owner"):
 
 
 # --------------------------------------------------------------------- run --
-def run_rules_only(spend_limit=None):
+def run_rules_only(spend_limit=None, part_limits=None):
     """Section 7: every part in part_id order, using the same public functions
-    the agent tools wrap. spend_limit overrides the live/.env limit. Raises
-    "Simulated crash" when CRASH_AFTER_ORDERS is reached; everything written
-    before stays."""
+    the agent tools wrap. spend_limit overrides the live/.env limit when
+    part_limits is not provided. Raises "Simulated crash" when
+    CRASH_AFTER_ORDERS is reached; everything written before stays."""
     run_id = start_run()
-    limit = get_spend_limit(spend_limit)      # once per run: one run never mixes two limits
+    limit = None if part_limits is not None else get_spend_limit(spend_limit)
     crash_after = _crash_after()
-    summary = {"run_id": run_id, "spend_limit": limit, "today": db.today(),
+    summary = {"run_id": run_id, "spend_limit": limit, "part_limits": part_limits, "today": db.today(),
                "placed": [], "pending_approval": [], "skipped": [], "checked": [],
                "no_viable_offer": [], "refused": []}
 
@@ -518,7 +565,7 @@ def run_rules_only(spend_limit=None):
         conn.close()
 
     for part_id in part_ids:
-        ev = evaluate_part(part_id, run_id, spend_limit=limit)
+        ev = evaluate_part(part_id, run_id, spend_limit=limit, part_limits=part_limits)
         if ev["existing_order"]:
             summary["skipped"].append(part_id)
             continue
@@ -527,9 +574,12 @@ def run_rules_only(spend_limit=None):
             continue
         outcome = "no_viable_offer"
         for offer in ev["eligible_offers"]:
-            if not recheck_offer(offer["offer_id"], ev["qty"], run_id)["passed"]:    # R5
+            order_qty = int(offer.get("qty", ev["qty"]))
+            if not recheck_offer(offer["offer_id"], order_qty, run_id)["passed"]:    # R5
                 continue
-            outcome = place_order(part_id, offer["offer_id"], ev["qty"], run_id, spend_limit=limit)["status"]
+            outcome = place_order(
+                part_id, offer["offer_id"], order_qty, run_id, spend_limit=limit, part_limits=part_limits
+            )["status"]
             break
         else:
             if ev["eligible_offers"]:

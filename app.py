@@ -37,11 +37,12 @@ st.markdown(
     [data-testid="stExpander"] summary p { font-size: 1.15rem; font-weight: 600; }
     [data-testid="stTable"] td, [data-testid="stTable"] th { font-size: 1.05rem; }
     .pb-summary { font-size: 1.6rem; font-weight: 700; margin: 0.2rem 0 0.8rem; }
-    .pb-table { width: 100%; border-collapse: collapse; font-size: 1.05rem; }
-    .pb-table th { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 2px solid rgba(128,128,128,.5); }
-    .pb-table td { padding: 0.55rem 0.6rem; border-bottom: 1px solid rgba(128,128,128,.25); vertical-align: top; }
+    .pb-table-wrap { max-height: 540px; overflow-y: auto; border: 1px solid rgba(128,128,128,.25); border-radius: 10px; }
+    .pb-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 1.05rem; }
+    .pb-table thead th { position: sticky; top: 0; z-index: 5; text-align: left; padding: 0.6rem 0.65rem; background: var(--secondary-background-color, #f0f2f6); border-bottom: 2px solid rgba(128,128,128,.5); }
+    .pb-table td { padding: 0.55rem 0.65rem; border-bottom: 1px solid rgba(128,128,128,.22); vertical-align: top; }
     .pb-table td:first-child { min-width: 17rem; }
-    .pb-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .pb-table td.num, .pb-table thead th.num { text-align: right; font-variant-numeric: tabular-nums; }
     .pb-table td.avail { font-weight: 800; font-size: 1.2rem; }
     .pb-why { display: block; font-size: 0.92rem; opacity: 0.75; margin-top: 0.15rem; }
     .pb-pill { padding: 0.1rem 0.55rem; border-radius: 999px; font-weight: 700; font-size: 0.95rem; white-space: nowrap; }
@@ -156,41 +157,88 @@ def plain_english(text):
     return text
 
 
-def today_label():
-    try:
-        return date.fromisoformat(TODAY).strftime("%a, %b %-d, %Y")
-    except ValueError:
-        return TODAY
+DEFAULT_PART_LIMITS = {"P01": 800, "P06": 1000}
 
+
+def default_today_date():
+    try:
+        return date.fromisoformat(TODAY)
+    except ValueError:
+        return date(2026, 11, 20)
+
+
+# Pre-read part names for sidebar selectors
+_sidebar_parts = read_table("SELECT part_id, name FROM parts ORDER BY part_id")
+_sidebar_part_names = (
+    dict(zip(_sidebar_parts["part_id"], _sidebar_parts["name"]))
+    if _sidebar_parts is not None
+    else {"P01": "Battery pack 14.4V", "P06": "Light source lamp module"}
+)
+_sidebar_part_ids = list(_sidebar_part_names.keys()) or ["P01", "P02", "P03", "P04", "P05", "P06", "P07", "P08"]
+
+if "part_limits" not in st.session_state:
+    st.session_state["part_limits"] = dict(DEFAULT_PART_LIMITS)
+if "selected_date" not in st.session_state:
+    st.session_state["selected_date"] = default_today_date()
 
 # --- Sidebar ---------------------------------------------------------------
 with st.sidebar:
     st.title("Parts Buyer")
     st.caption("Your shop's purchasing agent, with receipts")
-    st.text_input("Today", value=today_label(), disabled=True)
-    if USE_STATSIG:
-        # Owner sets the limit in the Statsig console; rules.py fetches it on each run.
-        try:
-            from config_flags import get_live_limit
+    selected_date = st.date_input(
+        "Today",
+        value=st.session_state["selected_date"],
+        help="Changes delivery deadline checks and the daily order key (advance the date to simulate a new day).",
+    )
+    st.session_state["selected_date"] = selected_date
+    os.environ["TODAY"] = selected_date.isoformat()
 
-            spend_limit, limit_source = get_live_limit()
-        except Exception as exc:
-            spend_limit, limit_source = float(os.getenv("SPEND_LIMIT", "1000")), ".env"
-            st.warning(f"backend not ready: config_flags ({exc})")
-        run_limit = None
-        with st.container(border=True):
-            st.markdown("**Live rules**")
-            st.markdown(f"Spending limit per order: **{money(spend_limit)}**")
-            if limit_source == "Statsig":
-                st.caption("Set by the owner in Statsig. Changes apply on the next run.")
-            else:
-                st.caption(":orange[Couldn't reach Statsig, so using the default limit.]")
-    else:
-        spend_limit = st.number_input(
-            "Spending limit per order ($)", min_value=0, value=1000, step=100,
-            help="Orders up to this total are placed automatically. Bigger ones wait for you.",
-        )
-        run_limit = spend_limit
+    with st.container(border=True):
+        st.markdown("**Part spending limits**")
+        st.caption("No global limit. Only parts listed below require approval if exceeded.")
+        current_limits = dict(st.session_state["part_limits"])
+        to_remove = None
+        for pid in sorted(current_limits.keys()):
+            col_val, col_rm = st.columns([4, 1])
+            with col_val:
+                new_val = st.number_input(
+                    f"{pid} {(_sidebar_part_names.get(pid) or '')[:18]} ($)".strip(),
+                    min_value=0,
+                    value=int(current_limits[pid]),
+                    step=100,
+                    key=f"limit_input_{pid}",
+                )
+                current_limits[pid] = float(new_val)
+            with col_rm:
+                st.markdown("<div style='height:1.85rem'></div>", unsafe_allow_html=True)
+                if st.button("✕", key=f"rm_limit_{pid}", help=f"Remove limit for {pid}"):
+                    to_remove = pid
+        if to_remove:
+            current_limits.pop(to_remove, None)
+            st.session_state["part_limits"] = current_limits
+            st.rerun()
+        st.session_state["part_limits"] = current_limits
+
+        unconfigured = [p for p in _sidebar_part_ids if p not in current_limits]
+        if unconfigured:
+            add_pid = st.selectbox(
+                "Add limit for part",
+                unconfigured,
+                format_func=lambda p: f"{p} {_sidebar_part_names.get(p, '')}".strip(),
+                key="add_limit_part",
+            )
+            add_c1, add_c2 = st.columns([2, 1.3])
+            with add_c1:
+                add_amt = st.number_input("Limit ($)", min_value=0, value=500, step=100, key="add_limit_amt")
+            with add_c2:
+                st.markdown("<div style='height:1.85rem'></div>", unsafe_allow_html=True)
+                if st.button("Add", key="add_limit_btn", width="stretch"):
+                    current_limits[add_pid] = float(add_amt)
+                    st.session_state["part_limits"] = current_limits
+                    st.rerun()
+
+    active_part_limits = dict(st.session_state["part_limits"])
+
     mode = st.radio(
         "Mode", ["Agent", "Rules only"], horizontal=True,
         help="Agent: the AI shops and explains. Rules only: the same rules run without the AI.",
@@ -207,6 +255,9 @@ if reset_clicked:
     st.session_state.pop("last_result", None)
     st.session_state.pop("last_activity", None)
     st.session_state.pop("last_part_states", None)
+    st.session_state["part_limits"] = dict(DEFAULT_PART_LIMITS)
+    st.session_state["selected_date"] = default_today_date()
+    os.environ["TODAY"] = default_today_date().isoformat()
     if "db" in backend:
         try:
             backend["db"].reset_demo()
@@ -350,8 +401,17 @@ if run_clicked:
                         for p in ev.get("part_ids") or []:
                             part_states.setdefault(p, "queued")
                         model_txt = ev.get("model") or "model"
+                        pl = ev.get("part_limits")
+                        if pl is not None:
+                            lim_txt = (
+                                ", ".join(f"{k}: {money(v)}" for k, v in sorted(pl.items()))
+                                if pl
+                                else "no part caps"
+                            )
+                        else:
+                            lim_txt = money(ev.get("spend_limit", 1000))
                         add_log(
-                            f"🚀 **Started run** (`{model_txt}`) · spending limit **{money(ev.get('spend_limit', 1000))}**"
+                            f"🚀 **Started run** (`{model_txt}`) · date **{ev.get('today', os.environ.get('TODAY'))}** · limits: **{lim_txt}**"
                         )
                         refresh_live_ui(f"0 / {total_parts} parts checked · Connected to {model_txt}")
 
@@ -389,7 +449,7 @@ if run_clicked:
                             part_states[pid] = "checking"
                             bits = [
                                 f"🔎 **{part_label(pid)}** — Short "
-                                f"({ev.get('available')} available < {ev.get('reorder_point')}), buying **{ev.get('qty')}**"
+                                f"({ev.get('available')} available < {ev.get('reorder_point')}), need **{ev.get('qty')}**"
                             ]
                             rejected = ev.get("rejected") or []
                             if rejected:
@@ -401,9 +461,14 @@ if run_clicked:
                             eligible = ev.get("eligible_offers") or []
                             if eligible:
                                 best = eligible[0]
+                                moq_tag = (
+                                    f", bulk batch {best.get('qty')}"
+                                    if best.get("bulk_applied")
+                                    else (f", min batch {best.get('qty')}" if best.get("min_order_qty", 1) > 1 else "")
+                                )
                                 bits.append(
                                     f"Best eligible: **{best.get('supplier_name') or supplier_label(best.get('supplier_id'))}** "
-                                    f"({money(best.get('landed'))})"
+                                    f"({money(best.get('landed'))}{moq_tag})"
                                 )
                             else:
                                 part_states[pid] = "blocked"
@@ -432,18 +497,20 @@ if run_clicked:
                         po_id = ev.get("po_id")
                         tot = ev.get("total")
                         lim = ev.get("spend_limit")
+                        bulk_tag = f" · bulk batch {ev.get('qty')}" if ev.get("bulk_applied") else ""
                         if st_val == "placed":
                             part_states[pid] = "ordered"
                             done_parts.add(pid)
+                            lim_note = f"within {money(lim)} limit" if lim is not None else "no spending cap"
                             add_log(
                                 f"🛒 **{part_label(pid)}** — Placed **{po_id}** with **{sup}** "
-                                f"({money(tot)}, within {money(lim)} limit)"
+                                f"({money(tot)}, {lim_note}{bulk_tag})"
                             )
                         elif st_val == "pending_approval":
                             part_states[pid] = "waiting"
                             done_parts.add(pid)
                             add_log(
-                                f"⏸️ **{part_label(pid)}** — Over {money(lim)} limit ({money(tot)}) "
+                                f"⏸️ **{part_label(pid)}** — Over {money(lim)} limit for {pid} ({money(tot)}{bulk_tag}) "
                                 f"→ Held **{po_id}** with **{sup}** for owner approval"
                             )
                         elif st_val == "exists":
@@ -488,16 +555,22 @@ if run_clicked:
                         )
 
                 sig = inspect.signature(backend["agent"].run_agent)
+                kwargs = {}
                 if "on_event" in sig.parameters:
-                    result = backend["agent"].run_agent(spend_limit=run_limit, on_event=on_event)
-                else:
-                    result = backend["agent"].run_agent(spend_limit=run_limit)
+                    kwargs["on_event"] = on_event
+                if "part_limits" in sig.parameters:
+                    kwargs["part_limits"] = active_part_limits
+                result = backend["agent"].run_agent(**kwargs)
                 st.session_state["last_activity"] = activity_lines
                 st.session_state["last_part_states"] = part_states
             else:
                 status_box = None
                 with st.status("Running rules engine…", expanded=False) as status_box:
-                    result = backend["rules"].run_rules_only(spend_limit=run_limit)
+                    r_sig = inspect.signature(backend["rules"].run_rules_only)
+                    if "part_limits" in r_sig.parameters:
+                        result = backend["rules"].run_rules_only(part_limits=active_part_limits)
+                    else:
+                        result = backend["rules"].run_rules_only()
                     status_box.update(label="Rules run finished.", state="complete", expanded=False)
                 st.session_state.pop("last_activity", None)
                 st.session_state.pop("last_part_states", None)
@@ -574,7 +647,9 @@ if st.session_state.get("ran") and db_ready:
     )
 
 waiting_tab = f"Approvals ({awaiting})" if awaiting else "Approvals"
-tab_inv, tab_appr, tab_orders, tab_audit = st.tabs(["Inventory", waiting_tab, "Orders", "Audit trail"])
+tab_inv, tab_appr, tab_orders, tab_offers, tab_audit = st.tabs(
+    ["Inventory", waiting_tab, "Orders", "Bulk & Suppliers", "Audit trail"]
+)
 
 # Inventory
 STATUS_PILLS = {
@@ -586,12 +661,14 @@ STATUS_PILLS = {
 
 
 def available_line(p):
-    """'1 on hand - 1 reserved + 2 on order = 2, enough.' Wording follows the backend's status."""
-    sums = f"{p['on_hand']} on hand - {p['reserved']} reserved + {p['on_order']} on order = {p['available']}"
+    """'2 on hand - 2 reserved = 0, short.' Wording follows available = on_hand - reserved."""
+    sums = f"{p['on_hand']} on hand - {p['reserved']} reserved = {p['available']}"
+    if p["on_order"]:
+        sums += f" ({p['on_order']} on order)"
     verdict = {
         "OK": "enough.",
         "Short": f"short: you want at least {p['reorder_point']}.",
-        "Ordered": "includes today's order.",
+        "Ordered": "ordered today.",
         "Awaiting approval": "short; an order is waiting for your approval.",
     }.get(p["status"], f"{p['status'].lower()}.")
     return f"{sums}, {verdict}"
@@ -606,21 +683,30 @@ with tab_inv:
         st.warning(f"backend not ready: rules ({inventory_error})")
     else:
         head = (
-            "<tr><th>Part</th><th>On hand</th><th>Reserved for jobs</th><th>On order</th>"
-            "<th>Available</th><th>Reorder at</th><th>Status</th></tr>"
+            "<thead><tr><th>Part</th><th class='num'>On hand</th><th class='num'>Reserved for jobs</th>"
+            "<th class='num'>On order</th><th class='num'>Available</th><th class='num'>Reorder at</th>"
+            "<th>Status</th></tr></thead>"
         )
         body = []
         for p in inventory:
             pill_class, pill_text = STATUS_PILLS.get(p["status"], ("", p["status"]))
+            lim_badge = (
+                f" · cap {money(active_part_limits[p['part_id']])}"
+                if p["part_id"] in active_part_limits
+                else ""
+            )
             body.append(
-                f"<tr><td><b>{p['part_id']}</b> {p['name']}<span class='pb-why'>{available_line(p)}</span></td>"
+                f"<tr><td><b>{p['part_id']}</b> {p['name']}<span class='pb-why'>{available_line(p)}{lim_badge}</span></td>"
                 f"<td class='num'>{p['on_hand']}</td><td class='num'>{p['reserved']}</td>"
                 f"<td class='num'>{p['on_order']}</td><td class='num avail'>{p['available']}</td>"
                 f"<td class='num'>{p['reorder_point']}</td>"
                 f"<td><span class='pb-pill {pill_class}'>{pill_text}</span></td></tr>"
             )
-        st.markdown(f"<table class='pb-table'>{head}{''.join(body)}</table>", unsafe_allow_html=True)
-        st.caption("Available = on hand - reserved for jobs + on order.")
+        st.markdown(
+            f"<div class='pb-table-wrap'><table class='pb-table'>{head}<tbody>{''.join(body)}</tbody></table></div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("Available = on hand - reserved for jobs (header locked while scrolling).")
 
 
 # Approvals
@@ -653,7 +739,9 @@ with tab_appr:
             part_log = audit[audit["part_id"] == pid] if audit is not None else pd.DataFrame()
             asked = part_log[part_log["step"] == "approval_requested"] if not part_log.empty else pd.DataFrame()
             limit_then = row_data(asked.iloc[-1]).get("spend_limit") if len(asked) else None
-            limit_then = float(limit_then) if limit_then is not None else float(spend_limit)
+            if limit_then is None:
+                limit_then = active_part_limits.get(pid, 0)
+            limit_then = float(limit_then)
             over = float(po["total"]) - limit_then
             notes = part_log[part_log["step"] == "agent_note"]["message"] if not part_log.empty else []
             chosen = part_log[part_log["step"] == "chosen"]["message"] if not part_log.empty else []
@@ -666,13 +754,13 @@ with tab_appr:
                 left, right = st.columns([3, 2])
                 with left:
                     st.markdown(
-                        f"**Part:** {pid} · {int(po['qty'])} needed  \n"
+                        f"**Part:** {pid} · {int(po['qty'])} ordered  \n"
                         f"**Supplier:** {supplier}  \n"
                         f"**Total:** {money(po['total'])} "
                         f"({int(po['qty'])} × {money(po['unit_price'])} + {money(po['shipping'])} shipping)"
                     )
                 with right:
-                    st.warning(f"**{money(over)} over your {money(limit_then)} limit**")
+                    st.warning(f"**{money(over)} over your {money(limit_then)} limit for {pid}**")
                 st.markdown(f"**Why this one:** {plain_english(reason)}")
                 a, r, _ = st.columns([1.3, 1, 3])
                 a.button(f"Approve {money(po['total'])}", key=f"approve_{po['po_id']}", type="primary",
@@ -699,7 +787,9 @@ with tab_orders:
                 return "—"
             if row["approved_by"]:
                 return str(row["approved_by"]).capitalize()
-            return "Auto (under limit)" if row["status"] == "placed" else ""
+            if row["status"] == "placed":
+                return "Auto (under part limit)" if row["part_id"] in active_part_limits else "Auto (no limit)"
+            return ""
 
         st.table(
             pd.DataFrame(
@@ -716,6 +806,86 @@ with tab_orders:
             ).set_index("Order #")
         )
         st.caption("Daily order ID: one order per part per day, so a retry or restart can never order twice.")
+
+# Bulk & Suppliers
+with tab_offers:
+    if not db_ready:
+        st.info("Press Reset demo")
+    else:
+        offers_df = read_table(
+            "SELECT o.offer_id, o.part_id, o.supplier_id, s.name AS supplier_name, "
+            "o.unit_price, COALESCE(o.min_order_qty, 1) AS min_order_qty, o.bulk_unit_price, "
+            "s.shipping_flat, s.lead_time_days, o.listed_stock "
+            "FROM offers o JOIN suppliers s ON s.supplier_id = o.supplier_id "
+            "ORDER BY o.part_id, o.offer_id"
+        )
+        if offers_df is None or offers_df.empty:
+            st.caption("No supplier offers loaded.")
+        else:
+            st.caption(
+                "Minimum order batch (MOQ): when an offer has a minimum batch > 1, buying from that offer "
+                "orders at least the minimum batch at the bulk unit price."
+            )
+            st.table(
+                pd.DataFrame(
+                    {
+                        "Offer": offers_df["offer_id"],
+                        "Part": [part_label(p) for p in offers_df["part_id"]],
+                        "Supplier": [str(n).replace(" (mock)", "") for n in offers_df["supplier_name"]],
+                        "Unit price": offers_df["unit_price"].map(money),
+                        "Min batch (MOQ)": offers_df["min_order_qty"].astype(int),
+                        "Bulk unit price": [
+                            money(v) if pd.notna(v) else "—" for v in offers_df["bulk_unit_price"]
+                        ],
+                        "Shipping": offers_df["shipping_flat"].map(money),
+                        "Lead time": [f"{int(d)}d" for d in offers_df["lead_time_days"]],
+                        "Catalog stock": offers_df["listed_stock"].astype(int),
+                    }
+                ).set_index("Offer")
+            )
+            with st.expander("Edit an offer's minimum batch / bulk discount", expanded=False):
+                offer_ids = list(offers_df["offer_id"])
+                offer_lookup = offers_df.set_index("offer_id").to_dict("index")
+                sel_oid = st.selectbox(
+                    "Offer",
+                    offer_ids,
+                    format_func=lambda oid: (
+                        f"{oid} — {part_label(offer_lookup[oid]['part_id'])} · "
+                        f"{str(offer_lookup[oid]['supplier_name']).replace(' (mock)', '')}"
+                    ),
+                )
+                cur = offer_lookup[sel_oid]
+                e1, e2, e3 = st.columns([1.2, 1.4, 1])
+                with e1:
+                    new_moq = st.number_input(
+                        "Min batch (MOQ)",
+                        min_value=1,
+                        value=int(cur["min_order_qty"] or 1),
+                        step=1,
+                        key=f"moq_edit_{sel_oid}",
+                    )
+                with e2:
+                    cur_bulk = 0.0 if pd.isna(cur["bulk_unit_price"]) else float(cur["bulk_unit_price"])
+                    new_bulk = st.number_input(
+                        "Bulk unit price ($; 0 = none)",
+                        min_value=0.0,
+                        value=cur_bulk,
+                        step=1.0,
+                        key=f"bulk_edit_{sel_oid}",
+                    )
+                with e3:
+                    st.markdown("<div style='height:1.85rem'></div>", unsafe_allow_html=True)
+                    if st.button("Save offer", key=f"save_offer_{sel_oid}", width="stretch"):
+                        try:
+                            backend["db"].update_offer_bulk(sel_oid, int(new_moq), new_bulk if new_bulk > 0 else None)
+                            st.session_state["flash"] = (
+                                "success",
+                                f"Updated {sel_oid}: min batch {int(new_moq)}"
+                                + (f", bulk price {money(new_bulk)}" if new_bulk > 0 else " (no bulk discount)") + ".",
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not update {sel_oid}: {exc}")
 
 # Audit trail
 with tab_audit:
@@ -778,6 +948,7 @@ if st.session_state.get("last_result"):
             pending_ids = result.get("pending_approval") or []
             ok_ids = result.get("checked") or []
             skipped_ids = result.get("skipped") or []
+            no_offer_ids = result.get("no_viable_offer") or []
             bullets = []
             if placed_ids:
                 bullets.append(
@@ -788,6 +959,11 @@ if st.session_state.get("last_result"):
                 bullets.append(
                     f"- **Waiting for your approval ({len(pending_ids)}):** "
                     + ", ".join(part_label(p) for p in pending_ids)
+                )
+            if no_offer_ids:
+                bullets.append(
+                    f"- **Short, no eligible supplier ({len(no_offer_ids)}):** "
+                    + ", ".join(part_label(p) for p in no_offer_ids)
                 )
             if ok_ids:
                 bullets.append(
@@ -804,11 +980,17 @@ if st.session_state.get("last_result"):
             meta_bits = []
             mode_label = "Agent" if result.get("mode") == "agent" else "Rules only"
             meta_bits.append(f"Mode: {mode_label}")
+            if result.get("today"):
+                meta_bits.append(f"Date: {result['today']}")
             if result.get("model"):
                 meta_bits.append(f"Model: `{result['model']}`")
             if result.get("elapsed_seconds") is not None:
                 meta_bits.append(f"Time: {result['elapsed_seconds']}s")
-            if result.get("spend_limit") is not None:
+            pl = result.get("part_limits")
+            if pl is not None:
+                lim_str = ", ".join(f"{k}: {money(v)}" for k, v in sorted(pl.items())) if pl else "None"
+                meta_bits.append(f"Part limits: {lim_str}")
+            elif result.get("spend_limit") is not None:
                 meta_bits.append(f"Spending limit: {money(result['spend_limit'])}")
             st.markdown(f"<span class='pb-meta'>{' · '.join(meta_bits)}</span>", unsafe_allow_html=True)
 
@@ -823,4 +1005,5 @@ if st.session_state.get("last_result"):
             st.json(result)
         else:
             st.write(result)
+
 

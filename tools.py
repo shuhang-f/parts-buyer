@@ -59,18 +59,18 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
             "name": "recheck_offer",
             "description": (
                 "Confirm live stock and current price with the supplier immediately before placing an order. "
-                "Always call this before place_order."
+                "Always call this before place_order, passing the offer's qty from eligible_offers (which includes any minimum order batch)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "offer_id": {
                         "type": "string",
-                        "description": "Offer ID such as O1, O2, ..., O10",
+                        "description": "Offer ID such as O1, O2, ..., O11",
                     },
                     "qty": {
                         "type": "integer",
-                        "description": "Quantity needed from evaluate_part",
+                        "description": "Order quantity for that offer from eligible_offers (includes any minimum batch)",
                     },
                 },
                 "required": ["offer_id", "qty"],
@@ -82,10 +82,10 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
         "function": {
             "name": "place_order",
             "description": (
-                "Submit an order for a part using an offer that passed recheck_offer. "
-                "ALWAYS call this even if landed cost exceeds the owner's spending limit: "
-                "rules.py enforces approved suppliers, deadline, quantity, live recheck, "
-                "idempotency, and routes orders over the limit into pending_approval for the owner."
+                "Submit an order for a part using an offer that passed recheck_offer, passing that offer's qty. "
+                "ALWAYS call this even if landed cost exceeds a part's spending limit: "
+                "rules.py enforces approved suppliers, deadline, minimum batch quantity, live recheck, "
+                "idempotency, and routes orders over the part's limit into pending_approval for the owner."
             ),
             "parameters": {
                 "type": "object",
@@ -139,17 +139,19 @@ def _normalize_offer_id(raw: Any) -> str:
 
 
 class ToolSession:
-    """Binds one agent run's run_id, resolved spend_limit, crash switch, and optional event hook."""
+    """Binds one agent run's run_id, spending limits, crash switch, and optional event hook."""
 
     def __init__(
         self,
         *,
         run_id: str,
-        spend_limit: float,
+        spend_limit: float | None = None,
+        part_limits: dict[str, float] | None = None,
         on_event: EventCallback | None = None,
     ) -> None:
         self.run_id = run_id
-        self.spend_limit = float(spend_limit)
+        self.spend_limit = None if spend_limit is None else float(spend_limit)
+        self.part_limits = part_limits
         self.crash_after = _crash_after()
         self.orders_placed_this_run = 0
         self.on_event = on_event
@@ -178,7 +180,12 @@ class ToolSession:
     def evaluate_part(self, part_id: str) -> dict[str, Any]:
         pid = _normalize_part_id(part_id)
         self._emit({"type": "part_start", "part_id": pid})
-        ev = rules.evaluate_part(pid, self.run_id, spend_limit=self.spend_limit)
+        ev = rules.evaluate_part(
+            pid,
+            self.run_id,
+            spend_limit=self.spend_limit,
+            part_limits=self.part_limits,
+        )
         for o in ev.get("eligible_offers", []):
             if o.get("offer_id"):
                 self._offer_to_part[o["offer_id"]] = pid
@@ -196,6 +203,7 @@ class ToolSession:
                 "existing_order": ev.get("existing_order"),
                 "qty": ev.get("qty", 0),
                 "deadline": ev.get("deadline"),
+                "spend_limit": ev.get("spend_limit"),
                 "eligible_offers": ev.get("eligible_offers", []),
                 "rejected": ev.get("rejected", []),
                 "action": ev.get("action", ""),
@@ -232,6 +240,7 @@ class ToolSession:
             q,
             self.run_id,
             spend_limit=self.spend_limit,
+            part_limits=self.part_limits,
         )
         self._emit(
             {
@@ -242,8 +251,10 @@ class ToolSession:
                 "status": res.get("status"),
                 "po_id": res.get("po_id"),
                 "total": res.get("total"),
-                "spend_limit": res.get("spend_limit", self.spend_limit),
+                "spend_limit": res.get("spend_limit"),
                 "supplier_id": res.get("supplier_id"),
+                "min_order_qty": res.get("min_order_qty", 1),
+                "bulk_applied": bool(res.get("bulk_applied")),
                 "reason": res.get("reason", ""),
             }
         )

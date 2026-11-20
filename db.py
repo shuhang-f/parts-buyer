@@ -42,12 +42,14 @@ CREATE TABLE suppliers (
     shipping_flat  REAL NOT NULL
 );
 CREATE TABLE offers (
-    offer_id     TEXT PRIMARY KEY,
-    part_id      TEXT NOT NULL REFERENCES parts(part_id),
-    supplier_id  TEXT NOT NULL REFERENCES suppliers(supplier_id),
-    unit_price   REAL NOT NULL,
-    listed_stock INTEGER NOT NULL,
-    live_stock   INTEGER NOT NULL
+    offer_id        TEXT PRIMARY KEY,
+    part_id         TEXT NOT NULL REFERENCES parts(part_id),
+    supplier_id     TEXT NOT NULL REFERENCES suppliers(supplier_id),
+    unit_price      REAL NOT NULL,
+    listed_stock    INTEGER NOT NULL,
+    live_stock      INTEGER NOT NULL,
+    min_order_qty   INTEGER NOT NULL DEFAULT 1,
+    bulk_unit_price REAL
 );
 CREATE TABLE jobs (
     job_id   TEXT PRIMARY KEY,
@@ -84,10 +86,11 @@ CREATE TABLE audit_log (
 INT_COLUMNS = {
     "parts": {"on_hand", "reserved", "on_order", "reorder_point", "reorder_qty"},
     "suppliers": {"lead_time_days"},
-    "offers": {"listed_stock", "live_stock"},
+    "offers": {"listed_stock", "live_stock", "min_order_qty"},
     "jobs": {"qty"},
 }
-REAL_COLUMNS = {"suppliers": {"shipping_flat"}, "offers": {"unit_price"}}
+REAL_COLUMNS = {"suppliers": {"shipping_flat"}, "offers": {"unit_price", "bulk_unit_price"}}
+NULLABLE_COLUMNS = {"offers": {"bulk_unit_price"}}
 
 
 class DatabaseNotReady(RuntimeError):
@@ -107,16 +110,32 @@ def connect(create=False):
 def _load_csv(conn, table):
     with open(DATA_DIR / f"{table}.csv", newline="") as f:
         rows = list(csv.DictReader(f))
+    nullable = NULLABLE_COLUMNS.get(table, ())
     for row in rows:
         for col in INT_COLUMNS.get(table, ()):
-            row[col] = int(row[col])
+            val = str(row.get(col, "")).strip()
+            row[col] = None if (col in nullable and val == "") else int(val or 1)
         for col in REAL_COLUMNS.get(table, ()):
-            row[col] = float(row[col])
+            val = str(row.get(col, "")).strip()
+            row[col] = None if (col in nullable and val == "") else float(val)
     cols = list(rows[0].keys())
     conn.executemany(
         f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
         [tuple(r[c] for c in cols) for r in rows],
     )
+
+
+def update_offer_bulk(offer_id, min_order_qty, bulk_unit_price):
+    """Update an offer's minimum order batch and optional bulk unit price."""
+    moq = max(1, int(min_order_qty))
+    bulk = None if bulk_unit_price in (None, "") or float(bulk_unit_price) <= 0 else float(bulk_unit_price)
+    with connect() as conn:
+        conn.execute(
+            "UPDATE offers SET min_order_qty = ?, bulk_unit_price = ? WHERE offer_id = ?",
+            (moq, bulk, offer_id),
+        )
+        conn.commit()
+    conn.close()
 
 
 def reset_demo():

@@ -13,7 +13,9 @@ def search_offers(part_id):
             """
             SELECT o.offer_id, o.part_id, o.supplier_id, s.name AS supplier_name,
                    s.country, s.lead_time_days, s.shipping_flat,
-                   o.unit_price, o.listed_stock
+                   o.unit_price, o.listed_stock,
+                   COALESCE(o.min_order_qty, 1) AS min_order_qty,
+                   o.bulk_unit_price
             FROM offers o JOIN suppliers s ON s.supplier_id = o.supplier_id
             WHERE o.part_id = ?
             ORDER BY o.offer_id
@@ -28,7 +30,9 @@ def recheck_offer(offer_id):
     """Live stock and price for one offer, or None if the offer does not exist."""
     with db.connect() as conn:
         row = conn.execute(
-            "SELECT offer_id, live_stock, unit_price FROM offers WHERE offer_id = ?",
+            "SELECT offer_id, live_stock, unit_price, "
+            "COALESCE(min_order_qty, 1) AS min_order_qty, bulk_unit_price "
+            "FROM offers WHERE offer_id = ?",
             (offer_id,),
         ).fetchone()
     conn.close()
